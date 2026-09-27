@@ -9,6 +9,8 @@ const { openStore } = require('./lib/store');
 
 const HOUR = 3600000;
 const DAY = 24 * HOUR;
+const CABINET = { id: 'GZ-01', school: '上海市格致中学',
+  location: '校园爱心伞演示柜（实际安装地点待定）' };
 const RULES = { borrowHours: 48, initialScore: 100, minimumScore: 60, maximumScore: 120,
   onTimeReward: 2, overduePenaltyPerDay: 10, restoreScore: 70, pickupSeconds: 60, stableSeconds: 3 };
 const STAGES = [
@@ -99,6 +101,60 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
     return user;
   }
   const activeLoan = userId => db.loans.find(loan => loan.userId === userId && ['pendingPickup', 'borrowed', 'returnPending'].includes(loan.status));
+  function currentUmbrellas() {
+    const slots = new Map();
+    for (const umbrella of db.umbrellas) {
+      const previous = slots.get(umbrella.slotId);
+      if (!previous || umbrella.id > previous.id) slots.set(umbrella.slotId, umbrella);
+    }
+    return [...slots.values()].sort((a, b) => a.slotId - b.slotId);
+  }
+  function summary(at = now()) {
+    const used = db.loans.filter(loan => loan.borrowedAt != null);
+    const matured = used.filter(loan => loan.dueAt <= at);
+    const returned = used.filter(loan => loan.status === 'returned' && loan.returnedAt <= at);
+    const slots = currentUmbrellas();
+    return { cutoffAt: at, borrowedCount: used.length, maturedCount: matured.length,
+      returnedMaturedCount: matured.filter(loan => loan.status === 'returned' && loan.returnedAt <= at).length,
+      onTimeMaturedCount: matured.filter(loan => loan.status === 'returned' && loan.returnedAt <= loan.dueAt).length,
+      openCount: used.filter(loan => ['borrowed', 'returnPending'].includes(loan.status)).length,
+      overdueOpenCount: used.filter(loan => ['borrowed', 'returnPending'].includes(loan.status) && loan.dueAt < at).length,
+      averageReturnedHours: returned.length ? Math.round(returned.reduce((sum, loan) => sum + (loan.returnedAt - loan.borrowedAt) / HOUR, 0) / returned.length * 10) / 10 : null,
+      damageCount: db.damageReports.length, reminderRecordedCount: db.reminders.filter(item => item.status === 'recorded').length,
+      availableCount: slots.filter(item => item.status === 'available').length,
+      maintenanceCount: slots.filter(item => item.status === 'maintenance').length,
+      lostCount: slots.filter(item => item.status === 'lost').length,
+      historicalLostCount: db.umbrellas.filter(item => item.status === 'lost').length };
+  }
+  function csv(rows) {
+    const cell = value => {
+      let content = value == null ? '' : typeof value === 'number' && value >= 1e12 ? new Date(value).toISOString() : String(value);
+      if (typeof value === 'string' && /^[\s]*[=+@-]/.test(content)) content = "'" + content;
+      return '"' + content.replaceAll('"', '""') + '"';
+    };
+    return '\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n') + '\r\n';
+  }
+  function exportRows(dataset) {
+    if (dataset === 'loans') return [['借用单ID','用户ID','身份','班级','雨伞号','仓位号','状态','借出时间','应还时间','归还时间','是否按时','是否损坏'],
+      ...db.loans.filter(item => item.borrowedAt != null).map(item => { const user = db.users.find(u => u.id === item.userId);
+        return [item.id, item.userId, user?.role, user?.className, item.umbrellaId, item.slotId, item.status,
+          item.borrowedAt, item.dueAt, item.returnedAt, item.onTime, item.damaged]; })];
+    if (dataset === 'reminders') return [['提醒ID','借用单ID','阶段','计划时间','记录时间','状态','模拟'],
+      ...db.reminders.map(item => [item.id, item.loanId, item.stage, item.scheduledAt, item.at, item.status, item.simulated])];
+    if (dataset === 'scores') return [['流水ID','用户ID','借用单ID','原因','变化分','余额','时间'],
+      ...db.scoreEvents.map(item => [item.id, item.userId, item.loanId, item.reason, item.change, item.score, item.at])];
+    if (dataset === 'damage') return [['报修ID','借用单ID','雨伞号','说明','是否有照片','上报时间'],
+      ...db.damageReports.map(item => [item.id, item.loanId, item.umbrellaId, item.description, !!item.photoFile, item.at])];
+    if (dataset === 'inventory') return [['雨伞号','仓位号','状态','是否当前伞'],
+      ...db.umbrellas.map(item => [item.id, item.slotId, item.status,
+        currentUmbrellas().some(current => current.id === item.id)])];
+    if (dataset === 'maintenance') return [['记录ID','雨伞号','状态','说明','时间'],
+      ...db.maintenance.map(item => [item.id, item.umbrellaId, item.status, item.note, item.at])];
+    if (dataset === 'devices') return [['事件ID','借用单ID','雨伞号','事件','发生时间','收到时间','模拟'],
+      ...db.deviceEvents.map(item => [item.id, item.loanId, item.umbrellaId, item.type, item.at, item.receivedAt, item.simulated])];
+    if (dataset === 'summary') return [['指标','数值'], ...Object.entries(summary()).map(([key, value]) => [key, value])];
+    fail('导出数据类型不存在。', 404);
+  }
   function decodePhoto(value) {
     if (value === undefined || value === null || value === '') return null;
     if (typeof value !== 'string' || value.length > 2100000) fail('照片过大，请选择不超过1.5MB的照片。', 413);
@@ -182,8 +238,10 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
     const localUrl = `http://127.0.0.1:${port}/`;
     const addresses = Object.values(os.networkInterfaces()).flat().filter(item => item && item.family === 'IPv4' && !item.internal);
     const urls = lan ? [...new Set(addresses.map(item => `http://${item.address}:${port}/`)), localUrl] : [localUrl];
-    return { now: at, rules: RULES, stages: STAGES, user, admin, demoUsers: DEMO_USERS,
-      umbrellas: db.umbrellas.map(item => ({ ...item })), loans,
+    const slots = currentUmbrellas();
+    return { now: at, rules: RULES, stages: STAGES, cabinet: CABINET, user, admin, demoUsers: DEMO_USERS,
+      umbrellas: slots.map(item => ({ ...item })), assets: admin ? db.umbrellas.map(item => ({ ...item })) : [],
+      summary: admin ? summary(at) : null, loans,
       reminders: db.reminders.filter(item => admin || (user && item.userId === user.id && item.status !== 'cancelled')).slice().reverse(),
       scoreEvents: db.scoreEvents.filter(item => admin || item.userId === user?.id).slice().reverse(),
       lockEvents: db.lockEvents.filter(item => admin || item.userId === user?.id).slice(-12).reverse(),
@@ -192,10 +250,11 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
       damageReports: db.damageReports.filter(item => admin || item.userId === user?.id).slice().reverse().map(publicReport),
       canBorrow: !!user && user.score >= RULES.minimumScore && !activeLoan(user.id),
       urls, lan, simulation: { identity: true, locks: true, push: true, device: true },
-      totals: { available: db.umbrellas.filter(item => item.status === 'available').length,
-        borrowed: db.umbrellas.filter(item => item.status === 'borrowed').length,
-        maintenance: db.umbrellas.filter(item => item.status === 'maintenance').length,
-        lost: db.umbrellas.filter(item => item.status === 'lost').length,
+      totals: { available: slots.filter(item => item.status === 'available').length,
+        borrowed: slots.filter(item => item.status === 'borrowed').length,
+        maintenance: slots.filter(item => item.status === 'maintenance').length,
+        lost: slots.filter(item => item.status === 'lost').length,
+        retired: slots.filter(item => item.status === 'retired').length,
         loans: admin ? db.loans.length : undefined }
     };
   }
@@ -229,7 +288,8 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
       if (url.pathname === '/api/label' && req.method === 'GET') {
         const kind = url.searchParams.get('kind');
         const id = Number(url.searchParams.get('id'));
-        if (!['umbrella', 'slot'].includes(kind) || !Number.isInteger(id) || !db.umbrellas.some(item => item.id === id)) fail('标识编号不正确。');
+        const asset = kind === 'umbrella' ? db.umbrellas.find(item => item.id === id) : currentUmbrellas().find(item => item.slotId === id);
+        if (!['umbrella', 'slot'].includes(kind) || !Number.isInteger(id) || !asset) fail('标识编号不正确。');
         const allowed = view({ headers: {} }).urls;
         const base = url.searchParams.get('url') || allowed[0];
         if (!allowed.includes(base)) fail('请选择当前演示地址。');
@@ -239,7 +299,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         const inner = qr.replace('<svg ', '<svg x="120" y="180" ');
         const title = kind === 'umbrella' ? `${id}号爱心伞` : `${id}号归还仓位`;
         const detail = kind === 'umbrella' ? '扫码查看雨伞状态与归还位置' : '扫码确认仓位并自助归还';
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="420" height="540" viewBox="0 0 420 540"><rect width="420" height="540" rx="24" fill="#fff"/><rect x="10" y="10" width="400" height="520" rx="20" fill="none" stroke="#205b87" stroke-width="3"/><text x="210" y="68" text-anchor="middle" fill="#205b87" font-size="26" font-family="sans-serif" font-weight="bold">上海市格致中学</text><text x="210" y="115" text-anchor="middle" fill="#16354d" font-size="32" font-family="sans-serif" font-weight="bold">${title}</text><text x="210" y="150" text-anchor="middle" fill="#557085" font-size="16" font-family="sans-serif">校园公益 · 免费借还 · 无需押金</text>${inner}<text x="210" y="395" text-anchor="middle" fill="#16354d" font-size="18" font-family="sans-serif">${detail}</text><text x="210" y="430" text-anchor="middle" fill="#557085" font-size="15" font-family="sans-serif">雨伞 ${id} ↔ 仓位 ${id}</text><text x="210" y="470" text-anchor="middle" fill="#557085" font-size="14" font-family="sans-serif">晴雨之间 · 校园爱心伞实验</text></svg>`;
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="420" height="540" viewBox="0 0 420 540"><rect width="420" height="540" rx="24" fill="#fff"/><rect x="10" y="10" width="400" height="520" rx="20" fill="none" stroke="#205b87" stroke-width="3"/><text x="210" y="68" text-anchor="middle" fill="#205b87" font-size="26" font-family="sans-serif" font-weight="bold">上海市格致中学</text><text x="210" y="115" text-anchor="middle" fill="#16354d" font-size="32" font-family="sans-serif" font-weight="bold">${title}</text><text x="210" y="150" text-anchor="middle" fill="#557085" font-size="16" font-family="sans-serif">校园公益 · 免费借还 · 无需押金</text>${inner}<text x="210" y="395" text-anchor="middle" fill="#16354d" font-size="18" font-family="sans-serif">${detail}</text><text x="210" y="430" text-anchor="middle" fill="#557085" font-size="15" font-family="sans-serif">雨伞 ${asset.id} ↔ 仓位 ${asset.slotId} · ${CABINET.id}</text><text x="210" y="470" text-anchor="middle" fill="#557085" font-size="14" font-family="sans-serif">晴雨之间 · 校园爱心伞实验</text></svg>`;
         res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
         return res.end(svg);
       }
@@ -256,6 +316,23 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
       if (url.pathname.startsWith('/api/')) {
         applyRules();
         if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, view(req));
+        if (req.method === 'GET' && url.pathname === '/api/asset') {
+          const kind = url.searchParams.get('kind');
+          const id = Number(url.searchParams.get('id'));
+          if (!Number.isInteger(id) || id < 1 || !['umbrella', 'slot'].includes(kind)) fail('标识编号不正确。');
+          const asset = kind === 'umbrella' ? db.umbrellas.find(item => item.id === id) : currentUmbrellas().find(item => item.slotId === id);
+          if (!asset) fail('找不到这个雨伞或仓位。', 404);
+          return json(res, 200, { kind, id, cabinet: CABINET, umbrella: { id: asset.id, slotId: asset.slotId, status: asset.status,
+            current: currentUmbrellas().some(item => item.id === asset.id) } });
+        }
+        if (req.method === 'GET' && url.pathname === '/api/admin/export') {
+          getActor(req, true);
+          const dataset = url.searchParams.get('dataset');
+          const result = csv(exportRows(dataset));
+          res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="gezhi-${dataset}.csv"`,
+            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+          return res.end(result);
+        }
         if (req.method !== 'POST') fail('接口不存在。', 404);
         const input = await body(req, url.pathname === '/api/return' || url.pathname === '/api/damage/report' ? 2200000 : 16384);
         // Recheck time after reading the request body; a deadline may have passed while it arrived.
@@ -288,7 +365,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
                 message: '仓位已开锁，请取走雨伞。' });
             fail('每人同时只能借一把伞，请先归还当前雨伞。', 409);
           }
-          const umbrella = db.umbrellas.find(item => item.id === Number(input.umbrellaId));
+          const umbrella = currentUmbrellas().find(item => item.id === Number(input.umbrellaId));
           if (!umbrella || umbrella.status !== 'available') fail('这把雨伞当前不可借，请选择其他雨伞。', 409);
           if (umbrella.offline) fail('该仓位暂时离线，请选择其他雨伞。', 409);
           if (umbrella.failNextOpen) {
@@ -313,7 +390,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
           const eventType = String(input.event || '');
           if (['fail-next-open', 'set-offline'].includes(eventType)) {
             if (actor.role !== 'admin') fail('只有管理员可以设置设备故障。', 403);
-            const umbrella = db.umbrellas.find(item => item.slotId === Number(input.slotId));
+            const umbrella = currentUmbrellas().find(item => item.slotId === Number(input.slotId));
             if (!umbrella) fail('仓位不存在。', 404);
             if (eventType === 'fail-next-open') umbrella.failNextOpen = true;
             else umbrella.offline = input.offline === true;
@@ -334,8 +411,11 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
           }
           if (eventType === 'fault') {
             if (!['borrowed', 'returnPending'].includes(loan.status)) fail('当前借用单不能登记设备故障。', 409);
+            const note = String(input.note || '用户报告仓位故障').trim();
+            if (note.length < 2 || note.length > 300) fail('请用2至300字说明设备故障。');
             loan.penaltyFrozenAt ||= now();
-            recordDevice(loan, 'fault', now(), { slotId: loan.slotId });
+            loan.faultNote = note;
+            recordDevice(loan, 'fault', now(), { slotId: loan.slotId, note });
             save(); return json(res, 200, { ok: true, message: '已登记设备异常，暂停新增逾期扣分。' });
           }
           if (eventType === 'return-confirm') {
@@ -401,15 +481,34 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         }
         if (url.pathname === '/api/admin/umbrella') {
           getActor(req, true);
-          const umbrella = db.umbrellas.find(item => item.id === Number(input.umbrellaId));
-          if (!umbrella || !['available', 'maintenance', 'lost'].includes(input.status)) fail('雨伞或状态不正确。');
-          if (umbrella.status === 'borrowed') fail('这把雨伞仍在借用中，不能直接修改库存状态。', 409);
+          const umbrella = currentUmbrellas().find(item => item.id === Number(input.umbrellaId));
+          if (!umbrella || !['available', 'maintenance', 'lost', 'retired'].includes(input.status)) fail('雨伞或状态不正确。');
+          if (['borrowed', 'pendingPickup'].includes(umbrella.status)) fail('这把雨伞仍在借用流程中，不能直接修改库存状态。', 409);
+          const transitions = { available: ['maintenance', 'lost'], maintenance: ['available', 'retired'],
+            lost: ['available', 'retired'], retired: [] };
+          if (umbrella.status !== input.status && !transitions[umbrella.status]?.includes(input.status)) fail('不允许这样修改雨伞状态。', 409);
           if (umbrella.status !== input.status) {
+            const note = String(input.note || '').trim();
+            if (note.length < 2 || note.length > 300) fail('请填写2至300字的维修或盘点说明。');
             umbrella.status = input.status;
-            db.maintenance.push({ id: crypto.randomUUID(), at: now(), umbrellaId: umbrella.id, status: input.status, note: String(input.note || '管理员更新状态').slice(0, 120) });
+            db.maintenance.push({ id: crypto.randomUUID(), at: now(), umbrellaId: umbrella.id, status: input.status, note });
             save();
           }
           return json(res, 200, { ok: true });
+        }
+        if (url.pathname === '/api/admin/umbrella/replenish') {
+          getActor(req, true);
+          const slotId = Number(input.slotId);
+          const previous = currentUmbrellas().find(item => item.slotId === slotId);
+          if (!previous || !['lost', 'retired'].includes(previous.status)) fail('该仓位不能补入新伞。', 409);
+          const note = String(input.note || '').trim();
+          if (note.length < 2 || note.length > 300) fail('请填写2至300字的补货说明。');
+          const umbrella = { id: Math.max(...db.umbrellas.map(item => item.id)) + 1, slotId, status: 'available' };
+          db.umbrellas.push(umbrella);
+          db.maintenance.push({ id: crypto.randomUUID(), at: now(), umbrellaId: umbrella.id, previousUmbrellaId: previous.id,
+            status: 'replenished', note });
+          save(); return json(res, 200, { ok: true, umbrella, previousUmbrellaId: previous.id,
+            message: `新${umbrella.id}号伞已补入${slotId}号仓位，请打印新伞标识。` });
         }
         if (url.pathname === '/api/admin/loan/exception') {
           getActor(req, true);

@@ -7,7 +7,7 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { createDemoServer } = require('./server');
 
-test('第二阶段：软件规则、设备模拟与 SQLite 持久化', async context => {
+test('第二至第三阶段：借还规则、设备模拟、维护和课题数据', async context => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'umbrella-phase2-'));
   const dataFile = path.join(temporary, 'state.sqlite');
   const photoData = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/N3sAAAAASUVORK5CYII=';
@@ -138,7 +138,7 @@ test('第二阶段：软件规则、设备模拟与 SQLite 持久化', async con
       assert.equal((await confirmReturn(loan, teacher)).status, 200);
       assert.equal((await state(teacher)).umbrellas[1].status, 'maintenance');
       assert.equal((await request('/api/borrow', { umbrellaId: 2 }, student)).status, 409);
-      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 2, status: 'available' }, admin)).status, 200);
+      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 2, status: 'available', note: '维修完成，检查可正常开合' }, admin)).status, 200);
       const second = await borrowAndPickup(2, student);
       assert.equal((await returnIntent(second, student, true, { damageNote: '伞面破损', photoData })).status, 200);
       assert.equal((await confirmReturn(second, student)).status, 200);
@@ -194,7 +194,8 @@ test('第二阶段：软件规则、设备模拟与 SQLite 持久化', async con
     });
     await context.test('R16、R18：故障暂停新增扣分，管理员结案阻止无限逾期', async () => {
       const loan = await borrowAndPickup(4, student);
-      assert.equal((await request('/api/demo/device', { event: 'fault', loanId: loan.id }, student)).status, 200);
+      assert.equal((await request('/api/demo/device', { event: 'fault', loanId: loan.id, note: '一号仓门无法打开' }, student)).status, 200);
+      assert.equal((await state(admin)).loans.find(item => item.id === loan.id).faultNote, '一号仓门无法打开');
       await advance(168);
       assert.equal((await state(student)).user.score, 100);
       assert.equal((await request('/api/admin/loan/exception', { loanId: loan.id, umbrellaStatus: 'lost', note: '实物盘点确认遗失' }, student)).status, 403);
@@ -205,6 +206,66 @@ test('第二阶段：软件规则、设备模拟与 SQLite 持久化', async con
       assert.equal(snapshot.loans[0].status, 'exception');
       assert.equal(snapshot.umbrellas[3].status, 'lost');
       assert.equal(snapshot.canBorrow, true);
+    });
+    await context.test('第三阶段：扫码映射、维修补货保留旧伞记录', async () => {
+      await reset();
+      const initial = await request('/api/asset?kind=slot&id=1');
+      assert.equal(initial.data.umbrella.id, 1);
+      assert.equal(initial.data.cabinet.school, '上海市格致中学');
+      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 1, status: 'lost' }, admin)).status, 400);
+      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 1, status: 'lost', note: '盘点发现雨伞丢失' }, student)).status, 403);
+      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 1, status: 'lost', note: '盘点发现雨伞丢失' }, admin)).status, 200);
+      assert.equal((await request('/api/admin/umbrella/replenish', { slotId: 1, note: '补入一把新雨伞' }, student)).status, 403);
+      const replenished = await request('/api/admin/umbrella/replenish', { slotId: 1, note: '补入一把新雨伞' }, admin);
+      assert.equal(replenished.status, 200);
+      assert.equal(replenished.data.umbrella.id, 7);
+      assert.equal(replenished.data.umbrella.slotId, 1);
+      assert.equal((await request('/api/admin/umbrella/replenish', { slotId: 1, note: '重复补货' }, admin)).status, 409);
+      assert.equal((await request('/api/asset?kind=umbrella&id=1')).data.umbrella.current, false);
+      assert.equal((await request('/api/asset?kind=slot&id=1')).data.umbrella.id, 7);
+      assert.equal((await state(student)).umbrellas.find(item => item.slotId === 1).id, 7);
+      assert.equal((await request('/api/borrow', { umbrellaId: 1 }, student)).status, 409);
+      const label = await fetch(base + '/api/label?kind=slot&id=1');
+      assert.match(await label.text(), /雨伞 7 ↔ 仓位 1/);
+      const loan = await borrowAndPickup(7, student);
+      assert.equal(loan.slotId, 1);
+      assert.equal((await request('/api/admin/umbrella', { umbrellaId: 7, status: 'lost', note: '借出中' }, admin)).status, 409);
+      assert.equal((await returnIntent(loan, student)).status, 200);
+      assert.equal((await confirmReturn(loan, student)).status, 200);
+      assert.equal((await state(admin)).assets.find(item => item.id === 1).status, 'lost');
+      await reset();
+    });
+    await context.test('第三阶段：统计口径与 CSV 导出权限', async () => {
+      const cancelled = await request('/api/borrow', { umbrellaId: 1 }, student);
+      assert.equal(cancelled.status, 200);
+      await advance(1);
+      assert.equal((await state(admin)).summary.borrowedCount, 0);
+      const first = await borrowAndPickup(1, student);
+      assert.equal((await state(admin)).summary.maturedCount, 0);
+      assert.equal((await returnIntent(first, student)).status, 200);
+      assert.equal((await confirmReturn(first, student)).status, 200);
+      assert.equal((await state(admin)).summary.returnedMaturedCount, 0);
+      const second = await borrowAndPickup(2, student);
+      await advance(72);
+      const metrics = (await state(admin)).summary;
+      assert.equal(metrics.borrowedCount, 2);
+      assert.equal(metrics.maturedCount, 2);
+      assert.equal(metrics.returnedMaturedCount, 1);
+      assert.equal(metrics.onTimeMaturedCount, 1);
+      assert.equal(metrics.overdueOpenCount, 1);
+      assert.equal((await request('/api/admin/export?dataset=loans')).status, 401);
+      assert.equal((await request('/api/admin/export?dataset=loans', undefined, student)).status, 403);
+      const exportResponse = await fetch(base + '/api/admin/export?dataset=loans', { headers: { Authorization: 'Bearer ' + admin } });
+      assert.equal(exportResponse.status, 200);
+      assert.match(exportResponse.headers.get('content-type'), /text\/csv/);
+      const bytes = Buffer.from(await exportResponse.arrayBuffer());
+      assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+      const content = bytes.toString('utf8');
+      assert.match(content, /"雨伞号"/);
+      assert.doesNotMatch(content, /演示同学一|00000000000/);
+      assert.equal(content.trim().split('\r\n').length, 3);
+      assert.equal((await request('/api/admin/export?dataset=unknown', undefined, admin)).status, 404);
+      await reset();
     });
     await context.test('二维码标识与服务文件访问边界', async () => {
       const qr = await fetch(base + '/api/qr');

@@ -3,14 +3,14 @@ const accounts = [
   { role: 'student', number: 'S2026002', name: '演示同学二', className: '高二（2）班' },
   { role: 'teacher', number: 'T0001', name: '演示老师', phone: '00000000000' }
 ];
-const statuses = { available: '可借用', pendingPickup: '待取伞', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失' };
+const statuses = { available: '可借用', pendingPickup: '待取伞', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失', retired: '已报废' };
 const stamp = value => {
   if (!value) return '待确认';
   const date = new Date(value); const pad = n => String(n).padStart(2, '0');
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 Page({
-  data: { tab: 'cabinet', account: accounts[0], pin: '123456', accountIndex: 0, state: null, busy: false, currentLoan: null, connected: false, error: '', adminPin: '2026', adminReady: false, scanResult: '',
+  data: { tab: 'cabinet', account: accounts[0], pin: '123456', accountIndex: 0, state: null, busy: false, currentLoan: null, connected: false, error: '', adminPin: '2026', adminReady: false, scanResult: '', adminNote: '', faultNote: '',
     damageMode: '', damageNote: '', damagePhotoPath: '', damageFlag: false, returnConfirmed: false },
   onLoad() { this.refresh(); },
   onShow() { this.timer = setInterval(() => { if (!this.data.busy) this.refresh(); }, 5000); },
@@ -51,10 +51,10 @@ Page({
       const match = /[?&](umbrella|slot)=(\d+)(?:&|$)/.exec(result.result || '');
       if (!match) throw new Error('这不是本实验的雨伞或仓位二维码。');
       const kind = match[1]; const id = Number(match[2]);
-      const umbrella = this.data.state.umbrellas.find(item => item.id === id);
-      if (!umbrella) throw new Error('没有找到这个编号。');
-      this.setData({ tab: 'cabinet', scanResult: `${id}号${kind === 'umbrella' ? '伞' : '仓位'} · 对应${id}号${kind === 'umbrella' ? '仓位' : '伞'} · ${statuses[umbrella.status]}` });
-      if (kind === 'slot' && this.data.currentLoan && this.data.currentLoan.slotId === id) wx.showToast({ title: '编号匹配，请点击归还这把伞', icon: 'none' });
+      const asset = await this.request(`/api/asset?kind=${kind}&id=${id}`);
+      const umbrella = asset.umbrella;
+      this.setData({ tab: 'cabinet', scanResult: `${asset.cabinet.school} · ${asset.cabinet.id} · ${asset.cabinet.location}\n${umbrella.id}号伞 / ${umbrella.slotId}号仓位 · ${statuses[umbrella.status]}${umbrella.current ? '' : '（旧伞，仅供查阅）'}` });
+      if (kind === 'slot' && this.data.currentLoan && this.data.currentLoan.slotId === id && this.data.currentLoan.umbrellaId === umbrella.id) wx.showToast({ title: '编号匹配，请点击归还这把伞', icon: 'none' });
     });
   },
   input(event) { this.setData({ [event.currentTarget.dataset.field]: event.detail.value }); },
@@ -82,6 +82,14 @@ Page({
   }); },
   startReturn() { this.beginDamage('return'); },
   startReport() { this.beginDamage('report'); },
+  reportFault() { this.run(async () => {
+    const loan = this.data.currentLoan;
+    if (!loan || !['borrowed', 'returnPending'].includes(loan.status)) throw new Error('当前没有可登记故障的借用单。');
+    const note = this.data.faultNote.trim();
+    if (note.length < 2) throw new Error('请填写仓位故障说明。');
+    const result = await this.request('/api/demo/device', { event: 'fault', loanId: loan.id, note });
+    this.setData({ faultNote: '' }); await this.refresh(); wx.showToast({ title: result.message, icon: 'none' });
+  }); },
   cancelDamage() { this.photoData = ''; this.setData({ damageMode: '', damagePhotoPath: '' }); },
   toggleDamage(event) {
     const report = this.data.state.damageReports.find(item => item.loanId === this.data.currentLoan?.id);
@@ -130,9 +138,28 @@ Page({
   adminLogin() { this.run(async () => { const result = await this.request('/api/admin/login', { pin: this.data.adminPin }); wx.setStorageSync('umbrella-admin', result.token); this.setData({ adminReady: true }); await this.refresh(); }); },
   advance(event) { this.run(async () => { await this.request('/api/demo/advance', { hours: Number(event.currentTarget.dataset.hours) }, true); await this.refresh(); wx.showToast({ title: '实验时间已推进', icon: 'none' }); }); },
   changeStatus(event) { this.run(async () => {
-    const index = await new Promise(resolve => wx.showActionSheet({ itemList: ['恢复可借用', '标记待维修', '登记遗失'], success: result => resolve(result.tapIndex), fail: () => resolve(-1) }));
+    const note = this.data.adminNote.trim();
+    if (note.length < 2) throw new Error('请先填写2至300字的维修或盘点说明。');
+    const item = this.data.state.umbrellas.find(asset => asset.id === Number(event.currentTarget.dataset.id));
+    const choices = { available: [['maintenance','标记待维修'],['lost','登记遗失']], maintenance: [['available','恢复可借'],['retired','报废']], lost: [['available','盘点后恢复'],['retired','报废']], retired: [] }[item.status] || [];
+    if (!choices.length) throw new Error('当前状态不能直接调整。');
+    const index = await new Promise(resolve => wx.showActionSheet({ itemList: choices.map(choice => choice[1]), success: result => resolve(result.tapIndex), fail: () => resolve(-1) }));
     if (index < 0) return;
-    await this.request('/api/admin/umbrella', { umbrellaId: Number(event.currentTarget.dataset.id), status: ['available', 'maintenance', 'lost'][index] }, true); await this.refresh();
+    await this.request('/api/admin/umbrella', { umbrellaId: item.id, status: choices[index][0], note }, true); this.setData({ adminNote: '' }); await this.refresh();
+  }); },
+  replenish(event) { this.run(async () => {
+    const note = this.data.adminNote.trim();
+    if (note.length < 2) throw new Error('请先填写补货说明。');
+    const result = await this.request('/api/admin/umbrella/replenish', { slotId: Number(event.currentTarget.dataset.slot), note }, true);
+    this.setData({ adminNote: '' }); await this.refresh(); wx.showModal({ title: '补货完成', content: result.message, showCancel: false });
+  }); },
+  closeException(event) { this.run(async () => {
+    const note = this.data.adminNote.trim();
+    if (note.length < 2) throw new Error('请先填写异常核查说明。');
+    const index = await new Promise(resolve => wx.showActionSheet({ itemList: ['核实后转待维修','核实后登记遗失'], success: result => resolve(result.tapIndex), fail: () => resolve(-1) }));
+    if (index < 0) return;
+    await this.request('/api/admin/loan/exception', { loanId: event.currentTarget.dataset.id, umbrellaStatus: ['maintenance','lost'][index], note }, true);
+    this.setData({ adminNote: '' }); await this.refresh();
   }); },
   reset() { this.run(async () => {
     const ok = await new Promise(resolve => wx.showModal({ title: '重置实验？', content: '将清空本原型的借还、积分和提醒记录。', success: result => resolve(result.confirm), fail: () => resolve(false) }));

@@ -2,7 +2,8 @@
 const $ = selector => document.querySelector(selector);
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 const stamp = value => value ? new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '待确认';
-const statusText = { available: '可借用', pendingPickup: '待取伞', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失' };
+const statusText = { available: '可借用', pendingPickup: '待取伞', borrowed: '已借出', maintenance: '待维修',
+  lost: '已登记遗失', retired: '已报废' };
 const activeStatus = status => ['pendingPickup', 'borrowed', 'returnPending'].includes(status);
 const umbrellaSvg = '<svg class="umbrella-art" viewBox="0 0 60 90" fill="none" aria-hidden="true"><path d="M30 8v-4M30 39v37c0 11 15 11 15 0" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><path d="M3 40C4 1 56 1 57 40c-9-8-18-8-27 0C21 32 12 32 3 40Z" fill="currentColor"/><path d="M30 12c-6 6-10 16-10 23M30 12c6 6 10 16 10 23" stroke="#ffffff" opacity=".4" stroke-width="1.5"/></svg>';
 let state;
@@ -13,6 +14,7 @@ let selectedAccount = 0;
 const scanParams = new URLSearchParams(location.search);
 const scannedKind = scanParams.has('umbrella') ? 'umbrella' : scanParams.has('slot') ? 'slot' : '';
 const scannedId = Number(scanParams.get(scannedKind));
+let scannedAsset = null;
 let photoUrls = [];
 const tokens = { user: localStorage.getItem('umbrella-user') || '', admin: localStorage.getItem('umbrella-admin') || '' };
 
@@ -45,6 +47,10 @@ async function refresh() {
     if (tab === 'admin') tab = 'cabinet';
     state = await api('/api/state', undefined, tokens.user);
     toast('服务重新启动或登录已过期，请重新选择演示身份。');
+  }
+  if (scannedKind && Number.isInteger(scannedId) && scannedId > 0) {
+    try { scannedAsset = await api(`/api/asset?kind=${scannedKind}&id=${scannedId}`, undefined, ''); }
+    catch { scannedAsset = null; }
   }
   if (previous !== JSON.stringify({ ...state, now: 0 }) || renderedTab !== tab) render();
   else $('#clock').textContent = '实验时间 ' + stamp(state.now);
@@ -109,16 +115,16 @@ function accountPanel() {
     <button class="text-button" id="logout">切换身份</button><div class="score-row"><span>我的信用积分</span><strong>${state.user.score}<small> 分</small></strong></div><div class="score-meter"><progress max="120" value="${state.user.score}" aria-label="信用积分"></progress></div>
     <div class="notice ${limited ? 'warning' : ''}">${limited ? '积分低于60分，借用权限暂时受限。归还雨伞后低于60分恢复到70分。' : loan ? '这把伞正在借还流程中，完成归还后可以再次借用。' : '借用权限正常，可以选择一把雨伞。'}</div>
     <p class="hint">按时归还 +2分；逾期每满24小时扣10分。<br>每人同时借一把，借期48小时。</p>
-    ${loan ? `<div class="current-loan"><h3>${loan.status === 'pendingPickup' ? '待取走' : '正在借用'} ${loan.umbrellaId} 号伞</h3><p>归还仓位：${loan.slotId} 号<br>应还时间：${stamp(loan.dueAt)}</p>${loan.overdue ? '<span class="tag overdue">已逾期，请尽快归还</span>' : ''}${state.damageReports.some(item => item.loanId === loan.id) ? '<p class="hint">已上报损坏，归还后自动转入待维修。</p>' : ''}${loan.status === 'pendingPickup' ? `<button class="primary wide" data-pickup="${loan.id}">模拟检测到取伞</button>` : `<button class="wide" data-report="${loan.id}">${state.damageReports.some(item => item.loanId === loan.id) ? '补充报修说明' : '上报雨伞损坏'}</button><button class="yellow wide" data-return="${loan.id}">归还这把伞</button>`}</div>` : ''}</aside>`;
+    ${loan ? `<div class="current-loan"><h3>${loan.status === 'pendingPickup' ? '待取走' : loan.status === 'returnPending' ? '归还待检测' : '正在借用'} ${loan.umbrellaId} 号伞</h3><p>归还仓位：${loan.slotId} 号<br>应还时间：${stamp(loan.dueAt)}</p>${loan.overdue ? '<span class="tag overdue">已逾期，请尽快归还</span>' : ''}${loan.faultNote ? `<p class="warning">已报障：${escapeHtml(loan.faultNote)}</p>` : ''}${state.damageReports.some(item => item.loanId === loan.id) ? '<p class="hint">已上报损坏，归还后自动转入待维修。</p>' : ''}${loan.status === 'pendingPickup' ? `<button class="primary wide" data-pickup="${loan.id}">模拟检测到取伞</button>` : `<button class="wide" data-report="${loan.id}">${state.damageReports.some(item => item.loanId === loan.id) ? '补充报修说明' : '上报雨伞损坏'}</button><button class="yellow wide" data-return="${loan.id}">归还这把伞</button><button class="text-button wide" data-fault="${loan.id}">仓位故障，无法归还？</button>`}</div>` : ''}</aside>`;
 }
 function cabinetView() {
-  const scannedItem = Number.isInteger(scannedId) ? state.umbrellas.find(item => item.id === scannedId) : null;
+  const scannedItem = scannedAsset?.umbrella;
   const scannedLoan = state.loans.find(item => ['borrowed', 'returnPending'].includes(item.status));
-  const scanPanel = scannedItem && scannedKind ? `<div class="section-panel scan-panel"><h2>扫码识别：${scannedId}号${scannedKind === 'umbrella' ? '爱心伞' : '归还仓位'}</h2><p>所属：上海市格致中学 · 晴雨之间<br>对应雨伞：${scannedId}号 · 对应仓位：${scannedId}号<br>当前状态：${statusText[scannedItem.status]}</p>${scannedKind === 'slot' && scannedLoan ? (scannedLoan.slotId === scannedId ? `<button class="primary" data-return="${scannedLoan.id}">归还到这个仓位</button>` : '<p class="warning">你借用的伞应归还到其他编号仓位。</p>') : ''}</div>` : '';
+  const scanPanel = scannedKind ? `<div class="section-panel scan-panel"><h2>扫码识别：${scannedId}号${scannedKind === 'umbrella' ? '爱心伞' : '归还仓位'}</h2>${scannedItem ? `<p>所属：${escapeHtml(scannedAsset.cabinet.school)} · 晴雨之间<br>伞柜：${escapeHtml(scannedAsset.cabinet.id)} · ${escapeHtml(scannedAsset.cabinet.location)}<br>对应雨伞：${scannedItem.id}号 · 对应仓位：${scannedItem.slotId}号<br>当前状态：${statusText[scannedItem.status]}${scannedItem.current ? '' : '（旧伞，仅供查阅）'}</p>${scannedKind === 'slot' && scannedLoan ? (scannedLoan.slotId === scannedId && scannedLoan.umbrellaId === scannedItem.id ? `<button class="primary" data-return="${scannedLoan.id}">归还到这个仓位</button>` : '<p class="warning">你借用的伞与此仓位当前雨伞编号不匹配。</p>') : ''}` : '<p class="warning">没有找到这个标识，请检查编号或联系管理员。</p>'}</div>` : '';
   return `${scanPanel}<div class="workbench">${accountPanel()}<section><div class="cabinet-heading"><h2>校园爱心伞柜</h2><span class="availability"><i class="status-dot"></i>${state.totals.available} 把可借</span></div>
-    <div class="cabinet"><div class="cabinet-top"><strong>格致中学 · 晴雨之间</strong><span>借一把 · 还一份温暖</span></div><div class="slots">${state.umbrellas.map(item => `<div class="slot ${item.status}" id="slot-${item.id}"><div class="slot-top"><span class="slot-number">${String(item.id).padStart(2, '0')}</span><span class="slot-status">${statusText[item.status]}</span></div>${umbrellaSvg}<button data-borrow="${item.id}" ${!state.canBorrow || item.status !== 'available' ? 'disabled' : ''}>${item.status === 'available' ? '借这把伞' : statusText[item.status]}</button></div>`).join('')}</div></div>
-    <p class="cabinet-note">每个仓位对应同编号雨伞。点击借伞后模拟解锁，归还时核对雨伞与仓位编号。</p>
-    <div class="entry-strip"><div class="entry-copy"><h3>打印伞与仓位标识</h3><p>选择编号，打印一张贴在伞柄、一张贴在对应仓位。二维码会打开该编号的信息页。</p><select id="label-id" aria-label="标识编号">${state.umbrellas.map(item => `<option value="${item.id}">${item.id}号伞 / ${item.slotId}号仓位</option>`).join('')}</select><div class="label-links"><a id="umbrella-label" target="_blank" rel="noopener" href="/api/label?kind=umbrella&id=1">查看伞标识</a><a id="slot-label" target="_blank" rel="noopener" href="/api/label?kind=slot&id=1">查看仓位标识</a></div></div></div>
+    <div class="cabinet"><div class="cabinet-top"><strong>格致中学 · 晴雨之间</strong><span>借一把 · 还一份温暖</span></div><div class="slots">${state.umbrellas.map(item => `<div class="slot ${item.status}" id="slot-${item.slotId}"><div class="slot-top"><span class="slot-number">${String(item.slotId).padStart(2, '0')}号仓</span><span class="slot-status">${statusText[item.status]}</span></div>${umbrellaSvg}<small>${item.id}号伞</small><button data-borrow="${item.id}" ${!state.canBorrow || item.status !== 'available' ? 'disabled' : ''}>${item.status === 'available' ? '借这把伞' : statusText[item.status]}</button></div>`).join('')}</div></div>
+    <p class="cabinet-note">雨伞与固定仓位一一绑定。补货后雨伞会换新编号，归还时按页面提示核对两个编号。</p>
+    <div class="entry-strip"><div class="entry-copy"><h3>打印伞与仓位标识</h3><p>选择仓位，分别打印当前雨伞和固定仓位标识。补货后请重印新伞标识。</p><select id="label-id" aria-label="仓位编号">${state.umbrellas.map(item => `<option value="${item.slotId}" data-umbrella-id="${item.id}">${item.id}号伞 / ${item.slotId}号仓位</option>`).join('')}</select><div class="label-links"><a id="umbrella-label" target="_blank" rel="noopener" href="/api/label?kind=umbrella&id=${state.umbrellas[0].id}">查看伞标识</a><a id="slot-label" target="_blank" rel="noopener" href="/api/label?kind=slot&id=${state.umbrellas[0].slotId}">查看仓位标识</a></div></div></div>
     <div class="entry-strip"><img class="qr-code" id="entry-qr" src="/api/qr?url=${encodeURIComponent(state.urls[0])}" alt="当前演示入口二维码"><div class="entry-copy"><h3>扫码进入爱心伞</h3><p>${state.lan ? '手机和电脑连接同一网络，选择电脑对应地址。' : '当前为本机入口。手机扫码请先运行“启动手机演示.cmd”。'}<br>此二维码打开网页演示，不是已发布的微信小程序码。</p><select id="entry-url" aria-label="二维码目标地址">${state.urls.map(url => `<option value="${escapeHtml(url)}">${escapeHtml(url)}</option>`).join('')}</select></div></div>
     </section></div>`;
 }
@@ -135,10 +141,13 @@ function recordsView() {
 function adminView() {
   if (!state.admin) return '<div class="section-panel empty">请使用管理员演示口令进入。</div>';
   const overdue = state.loans.filter(item => item.overdue);
+  const summary = state.summary;
+  const rate = summary.maturedCount ? `${Math.round(summary.returnedMaturedCount / summary.maturedCount * 100)}%` : '样本不足';
   return `<div class="metrics">${[['可借雨伞', state.totals.available], ['已借出', state.totals.borrowed], ['逾期未还', overdue.length], ['待修 / 遗失', state.totals.maintenance + ' / ' + state.totals.lost]].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join('')}</div>
-    <section class="section-panel"><h2>雨伞与仓位管理</h2><div class="table-wrap"><table><thead><tr><th>雨伞</th><th>仓位</th><th>当前状态</th><th>状态调整</th></tr></thead><tbody>${state.umbrellas.map(item => `<tr><td>${item.id}号伞</td><td>${item.slotId}号仓位</td><td>${statusText[item.status]}</td><td>${['borrowed', 'pendingPickup'].includes(item.status) ? '借用流程中，等待归还' : `<select data-status="${item.id}" aria-label="${item.id}号伞状态">${['available', 'maintenance', 'lost'].map(status => `<option value="${status}" ${item.status === status ? 'selected' : ''}>${statusText[status]}</option>`).join('')}</select>`}</td></tr>`).join('')}</tbody></table></div></section>
+    <section class="section-panel"><h2>课题观察数据</h2><p>截至 ${stamp(summary.cutoffAt)}，已确认借出 ${summary.borrowedCount} 次，其中借期已到 ${summary.maturedCount} 次，已归还 ${summary.returnedMaturedCount} 次；到期样本归还率 ${rate}。按时归还 ${summary.onTimeMaturedCount} 次，未结 ${summary.openCount} 次，报修 ${summary.damageCount} 次。</p><p class="hint">只用已到期借用单计算归还率；样本量很小时不宜据此判断积分机制的效果。导出文件使用用户内部编号，不含姓名、电话或照片。</p><div class="button-row">${[['summary','统计概览'],['loans','借还记录'],['reminders','提醒记录'],['scores','积分流水'],['damage','报修记录'],['inventory','库存历史'],['maintenance','维修补货'],['devices','设备事件']].map(([id,label]) => `<button data-export="${id}">导出${label} CSV</button>`).join('')}</div></section>
+    <section class="section-panel"><h2>雨伞与仓位管理</h2><p class="hint">正常借还由师生自助完成；管理员只处理维修、盘点遗失、补货和无法完成归还的异常。每次处理都需填写说明。</p><div class="table-wrap"><table><thead><tr><th>雨伞</th><th>仓位</th><th>当前状态</th><th>异常处理</th></tr></thead><tbody>${state.umbrellas.map(item => `<tr><td>${item.id}号伞</td><td>${item.slotId}号仓位</td><td>${statusText[item.status]}</td><td>${['borrowed', 'pendingPickup'].includes(item.status) ? '借用流程中' : `<button data-manage="${item.id}">调整状态</button>${['lost','retired'].includes(item.status) ? `<button data-replenish="${item.slotId}">补入新伞</button>` : ''}`}</td></tr>`).join('')}</tbody></table></div></section>
     <div class="admin-grid"><section class="section-panel"><h2>逾期名单</h2>${recordList(overdue)}</section><section class="section-panel"><h2>用户积分</h2>${state.users.map(user => `<div class="record"><div class="record-top"><strong>${escapeHtml(user.name)}</strong><span class="tag ${user.score < 60 ? 'overdue' : ''}">${user.score}分</span></div><p>${user.role === 'teacher' ? '教师' : '学生'}　${escapeHtml(user.number)}${user.score < 60 ? '　借用权限受限' : ''}</p></div>`).join('')}</section></div>
-    <section class="section-panel"><h2>全部借还记录</h2>${recordList(state.loans)}</section><div class="admin-grid"><section class="section-panel"><h2>模拟开锁记录</h2>${state.lockEvents.length ? state.lockEvents.map(item => `<div class="record"><div class="record-top"><strong>${item.slotId}号仓位 · ${item.purpose === 'borrow' ? '借伞开锁' : '归还开锁'}</strong><span class="tag muted">模拟</span></div><p>${stamp(item.at)}　对应${item.umbrellaId}号伞</p></div>`).join('') : '<p class="empty">借还操作后生成开锁记录。</p>'}</section><section class="section-panel"><h2>报修照片与说明</h2>${state.damageReports.length ? state.damageReports.map(reportCard).join('') : '<p class="empty">暂时没有报修记录。</p>'}</section></div>`;
+    <section class="section-panel"><h2>全部借还记录</h2>${state.loans.length ? state.loans.map(loan => `<div class="record"><div class="record-top"><strong>${escapeHtml(loan.userName)} · ${loan.umbrellaId}号伞</strong><span class="tag ${loan.overdue ? 'overdue' : ''}">${loan.status === 'exception' ? '异常已结案' : loan.status === 'returned' ? '已归还' : loan.status === 'cancelled' ? '取伞超时取消' : loan.overdue ? '逾期未还' : loan.status === 'returnPending' ? '归还待检测' : '借用中'}</span></div><p>仓位 ${loan.slotId} · 应还 ${stamp(loan.dueAt)}${loan.faultNote ? '<br>设备故障：' + escapeHtml(loan.faultNote) : ''}${loan.exceptionNote ? '<br>结案说明：' + escapeHtml(loan.exceptionNote) : ''}</p>${['borrowed','returnPending'].includes(loan.status) ? `<button data-exception="${loan.id}">核实后异常结案</button>` : ''}</div>`).join('') : '<p class="empty">暂无借还记录。</p>'}</section><div class="admin-grid"><section class="section-panel"><h2>模拟开锁记录</h2>${state.lockEvents.length ? state.lockEvents.map(item => `<div class="record"><div class="record-top"><strong>${item.slotId}号仓位 · ${item.purpose === 'borrow' ? '借伞开锁' : '归还开锁'}</strong><span class="tag muted">模拟</span></div><p>${stamp(item.at)}　对应${item.umbrellaId}号伞</p></div>`).join('') : '<p class="empty">借还操作后生成开锁记录。</p>'}</section><section class="section-panel"><h2>报修照片与说明</h2>${state.damageReports.length ? state.damageReports.map(reportCard).join('') : '<p class="empty">暂时没有报修记录。</p>'}</section></div><section class="section-panel"><h2>维修与补货记录</h2>${state.maintenance.length ? state.maintenance.map(item => `<div class="record"><strong>${item.umbrellaId}号伞 · ${item.status === 'replenished' ? '补入新伞' : statusText[item.status]}</strong><p>${stamp(item.at)} · ${escapeHtml(item.note)}${item.previousUmbrellaId ? ` · 替换旧${item.previousUmbrellaId}号伞` : ''}</p></div>`).join('') : '<p class="empty">暂无维修或补货记录。</p>'}</section>`;
 }
 function render() {
   renderedTab = tab;
@@ -206,6 +215,27 @@ function openDamageReport(loanId) {
     finally { button.disabled = false; }
   });
 }
+function actionDialog({ title, description, endpoint, fields, payload, success }) {
+  modal(`<h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p><form id="action-form">${fields}<label for="action-note">处理说明（2至300字）</label><textarea class="field" id="action-note" name="note" minlength="2" maxlength="300" rows="3" required placeholder="写明核查或维修情况"></textarea><p class="error" id="action-error"></p><div class="dialog-actions"><button type="button" data-close>取消</button><button class="primary" type="submit">确认处理</button></div></form>`);
+  $('#action-form').addEventListener('submit', async event => {
+    event.preventDefault(); const button = event.submitter; button.disabled = true;
+    try {
+      const data = new FormData(event.target);
+      const result = await api(endpoint, { ...payload, status: data.get('status'), umbrellaStatus: data.get('umbrellaStatus'), note: data.get('note') }, tokens.admin);
+      $('#modal').close(); await refresh(); toast(success || result.message || '处理完成。');
+    } catch (error) { $('#action-error').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+}
+async function exportCsv(dataset) {
+  const response = await fetch(`/api/admin/export?dataset=${encodeURIComponent(dataset)}`, { headers: { Authorization: 'Bearer ' + tokens.admin } });
+  if (!response.ok) { const result = await response.json(); throw new Error(result.error || '导出失败。'); }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url; link.download = `gezhi-${dataset}.csv`; document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
 document.addEventListener('submit', async event => {
   if (event.target.id !== 'login-form') return;
   event.preventDefault(); const button = event.submitter; button.disabled = true;
@@ -238,6 +268,21 @@ document.addEventListener('click', async event => {
     }
     if (button.hasAttribute('data-return')) { button.disabled = true; await openReturn(button.dataset.return); button.disabled = false; return; }
     if (button.hasAttribute('data-report')) return openDamageReport(button.dataset.report);
+    if (button.hasAttribute('data-fault')) {
+      const loanId = button.dataset.fault;
+      modal('<h2>登记仓位故障</h2><p>无法正常归还时，请说明情况。实验中会暂停后续自动扣分，并由管理员核查；雨伞仍在你的借用记录中。</p><form id="fault-form"><label for="fault-note">故障说明</label><textarea id="fault-note" name="note" class="field" minlength="2" maxlength="300" rows="3" required placeholder="例如：仓门无法打开，无法放入雨伞"></textarea><p class="error" id="fault-error"></p><div class="dialog-actions"><button type="button" data-close>取消</button><button class="primary" type="submit">登记故障</button></div></form>');
+      $('#fault-form').addEventListener('submit', async formEvent => { formEvent.preventDefault(); const submit = formEvent.submitter; submit.disabled = true; try { const result = await api('/api/demo/device', { event: 'fault', loanId, note: new FormData(formEvent.target).get('note') }); $('#modal').close(); await refresh(); toast(result.message); } catch (error) { $('#fault-error').textContent = error.message; } finally { submit.disabled = false; } });
+      return;
+    }
+    if (button.hasAttribute('data-manage')) {
+      const item = state.umbrellas.find(asset => asset.id === Number(button.dataset.manage));
+      const transitions = { available: ['maintenance','lost'], maintenance: ['available','retired'], lost: ['available','retired'], retired: [] };
+      if (!transitions[item.status].length) return toast('此伞已报废，可从该仓位补入新伞。');
+      return actionDialog({ title: `${item.id}号伞状态调整`, description: `当前${statusText[item.status]}，位于${item.slotId}号仓位。`, endpoint: '/api/admin/umbrella', payload: { umbrellaId: item.id }, fields: `<label for="action-status">调整为</label><select class="field" id="action-status" name="status">${transitions[item.status].map(value => `<option value="${value}">${statusText[value]}</option>`).join('')}</select>` });
+    }
+    if (button.hasAttribute('data-replenish')) return actionDialog({ title: `${button.dataset.replenish}号仓位补货`, description: '新伞会获得新的唯一编号，旧伞的历史记录仍保留。补货后请打印新伞标识。', endpoint: '/api/admin/umbrella/replenish', payload: { slotId: Number(button.dataset.replenish) }, fields: '' });
+    if (button.hasAttribute('data-exception')) return actionDialog({ title: '借用异常结案', description: '请先核查实物与用户情况。结案会结束该借用单，并把雨伞登记为待维修或遗失。', endpoint: '/api/admin/loan/exception', payload: { loanId: button.dataset.exception }, fields: '<label for="action-status">雨伞状态</label><select class="field" id="action-status" name="umbrellaStatus"><option value="maintenance">待维修</option><option value="lost">已登记遗失</option></select>' });
+    if (button.hasAttribute('data-export')) { await exportCsv(button.dataset.export); return toast('CSV 已开始下载。'); }
     if (button.hasAttribute('data-advance')) return withAdmin(async () => {
       await api('/api/demo/advance', { hours: Number(button.dataset.advance) }, tokens.admin); await refresh(); toast('实验时间已推进，提醒和积分已更新。');
     });
@@ -259,15 +304,12 @@ document.addEventListener('change', async event => {
   }
   if (select.id === 'entry-url') $('#entry-qr').src = '/api/qr?url=' + encodeURIComponent(select.value);
   if (select.id === 'entry-url' || select.id === 'label-id') {
-    const id = $('#label-id')?.value || '1';
+    const option = $('#label-id')?.selectedOptions[0];
+    const slotId = option?.value || '1';
+    const umbrellaId = option?.dataset.umbrellaId || '1';
     const url = $('#entry-url')?.value || state.urls[0];
-    $('#umbrella-label').href = `/api/label?kind=umbrella&id=${id}&url=${encodeURIComponent(url)}`;
-    $('#slot-label').href = `/api/label?kind=slot&id=${id}&url=${encodeURIComponent(url)}`;
-  }
-  if (select.hasAttribute('data-status')) {
-    select.disabled = true;
-    try { await api('/api/admin/umbrella', { umbrellaId: Number(select.dataset.status), status: select.value }, tokens.admin); await refresh(); toast('雨伞状态已更新。'); }
-    catch (error) { select.disabled = false; toast(error.message); await refresh(); }
+    $('#umbrella-label').href = `/api/label?kind=umbrella&id=${umbrellaId}&url=${encodeURIComponent(url)}`;
+    $('#slot-label').href = `/api/label?kind=slot&id=${slotId}&url=${encodeURIComponent(url)}`;
   }
 });
 refresh().catch(error => { $('#app').innerHTML = '<p class="empty">暂时无法连接，请确认启动窗口仍在运行，然后刷新页面。</p>'; toast(error.message); });
