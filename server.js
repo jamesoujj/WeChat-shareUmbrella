@@ -6,6 +6,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const QRCode = require('qrcode');
 const { openStore } = require('./lib/store');
+const { createWechatAdapter } = require('./lib/wechat');
 
 const HOUR = 3600000;
 const DAY = 24 * HOUR;
@@ -24,20 +25,57 @@ const DEMO_USERS = [
   { id: 'teacher-1', role: 'teacher', number: 'T0001', name: '演示老师', phone: '00000000000' }
 ];
 
-function seed() {
+function normalizedRoster(roster) {
+  if (!Array.isArray(roster) || !roster.length) throw new Error('校内核验名单不能为空。');
+  const ids = new Set(); const numbers = new Set();
+  return roster.map(item => {
+    if (!item || !['student', 'teacher'].includes(item.role) ||
+        !['id', 'number', 'name'].every(key => typeof item[key] === 'string' && item[key].trim()) ||
+        typeof (item.role === 'student' ? item.className : item.phone) !== 'string')
+      throw new Error('校内核验名单格式不正确。');
+    const identity = `${item.role}:${item.number}`;
+    if (ids.has(item.id) || numbers.has(identity)) throw new Error('校内核验名单存在重复身份。');
+    ids.add(item.id); numbers.add(identity);
+    return item.role === 'student'
+      ? { id: item.id, role: item.role, number: item.number, name: item.name, className: item.className }
+      : { id: item.id, role: item.role, number: item.number, name: item.name, phone: item.phone };
+  });
+}
+function seed(roster = DEMO_USERS) {
   return {
     version: 2, offsetMs: 0,
-    users: DEMO_USERS.map(user => ({ ...user, score: RULES.initialScore })),
+    users: roster.map(user => ({ ...user, score: RULES.initialScore })),
     umbrellas: Array.from({ length: 6 }, (_, index) => ({ id: index + 1, slotId: index + 1, status: 'available' })),
     loans: [], reminders: [], scoreEvents: [], lockEvents: [], maintenance: [], damageReports: [], deviceEvents: []
   };
 }
 
-function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlite'), lan = false } = {}) {
-  const store = openStore(dataFile, seed);
+function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlite'), lan = false,
+  wechatAdapter = null, roster = DEMO_USERS, adminPin = '2026', allowDemoControls = !wechatAdapter,
+  publicUrl = null } = {}) {
+  const wechatMode = !!wechatAdapter;
+  if (publicUrl) {
+    const parsed = new URL(publicUrl);
+    if (parsed.protocol !== 'https:' || parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password)
+      throw new Error('小程序公开服务地址必须是 HTTPS 域名根地址。');
+    publicUrl = parsed.toString();
+  }
+  if (wechatMode && (typeof adminPin !== 'string' || adminPin.length < 12))
+    throw new Error('微信联调模式需要校内核验名单和至少12位管理员口令。');
+  const approvedRoster = normalizedRoster(roster);
+  const store = openStore(dataFile, () => seed(approvedRoster));
   let db = store.read();
+  if (wechatMode && (db.users.length !== approvedRoster.length || approvedRoster.some(user => {
+    const persisted = db.users.find(item => item.id === user.id);
+    return !persisted || Object.entries(user).some(([key, value]) => persisted[key] !== value);
+  }))) {
+    store.close(); throw new Error('现有微信联调数据库与核验名单不一致；请先备份并处理数据。');
+  }
   const photoDir = path.join(path.dirname(dataFile), 'photos');
   const sessions = new Map();
+  let processingReminders = false;
+  const publicUser = user => user && { ...Object.fromEntries(Object.entries(user).filter(([key]) =>
+    !['wechatOpenId', 'bindCodeHash', 'bindCodeExpires'].includes(key))), wechatBound: !!user.wechatOpenId };
   const now = () => Date.now() + db.offsetMs;
   const save = () => {
     try { store.write(db); }
@@ -67,7 +105,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         if (effectiveAt >= loan.borrowedAt + stage.hours * HOUR && !loan.reminded.includes(stage.hours)) {
           db.reminders.push({ id: crypto.randomUUID(), userId: user.id, loanId: loan.id, umbrellaId: loan.umbrellaId,
             at, scheduledAt: loan.borrowedAt + stage.hours * HOUR, stage: stage.label, text: stage.text,
-            status: 'recorded', simulated: true });
+            status: 'recorded', simulated: !wechatMode, deliveryStatus: wechatMode ? 'pending' : 'simulated' });
           loan.reminded.push(stage.hours);
           changed = true;
         }
@@ -99,6 +137,40 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
     const user = db.users.find(item => item.id === actor.userId);
     if (!user) fail('请先选择学生或教师身份。', 403);
     return user;
+  }
+  function sessionFor(user) {
+    const token = crypto.randomBytes(24).toString('hex');
+    sessions.set(token, { role: user.role, userId: user.id, expires: Date.now() + 24 * HOUR });
+    return token;
+  }
+  async function processWeChatReminders() {
+    if (!wechatMode || processingReminders) return;
+    processingReminders = true;
+    try {
+      for (const reminder of db.reminders.filter(item => item.deliveryStatus === 'pending')) {
+        const loan = db.loans.find(item => item.id === reminder.loanId);
+        const user = db.users.find(item => item.id === reminder.userId);
+        if (!loan || !user || loan.status === 'returned' || loan.status === 'exception' || reminder.status === 'cancelled') {
+          reminder.deliveryStatus = 'cancelled'; save(); continue;
+        }
+        if (db.reminders.some(item => item.loanId === reminder.loanId && item.deliveryStatus === 'pending' &&
+            item.scheduledAt > reminder.scheduledAt)) {
+          reminder.deliveryStatus = 'superseded'; save(); continue;
+        }
+        if (!user.wechatOpenId || !loan.subscriptionCredits) {
+          reminder.deliveryStatus = 'not_authorized'; save(); continue;
+        }
+        loan.subscriptionCredits -= 1;
+        reminder.deliveryStatus = 'attempted'; reminder.attemptedAt = now(); save();
+        try {
+          const result = await wechatAdapter.sendReminder(user.wechatOpenId, reminder, loan);
+          reminder.deliveryStatus = 'accepted'; reminder.providerMessageId = result?.msgid || null;
+        } catch (error) {
+          reminder.deliveryStatus = 'failed'; reminder.providerError = String(error.message).slice(0, 120);
+        }
+        save();
+      }
+    } finally { processingReminders = false; }
   }
   const activeLoan = userId => db.loans.find(loan => loan.userId === userId && ['pendingPickup', 'borrowed', 'returnPending'].includes(loan.status));
   function currentUmbrellas() {
@@ -139,8 +211,9 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
       ...db.loans.filter(item => item.borrowedAt != null).map(item => { const user = db.users.find(u => u.id === item.userId);
         return [item.id, item.userId, user?.role, user?.className, item.umbrellaId, item.slotId, item.status,
           item.borrowedAt, item.dueAt, item.returnedAt, item.onTime, item.damaged]; })];
-    if (dataset === 'reminders') return [['提醒ID','借用单ID','阶段','计划时间','记录时间','状态','模拟'],
-      ...db.reminders.map(item => [item.id, item.loanId, item.stage, item.scheduledAt, item.at, item.status, item.simulated])];
+    if (dataset === 'reminders') return [['提醒ID','借用单ID','阶段','计划时间','记录时间','站内状态','微信接口状态','接口受理编号','错误','模拟'],
+      ...db.reminders.map(item => [item.id, item.loanId, item.stage, item.scheduledAt, item.at, item.status,
+        item.deliveryStatus, item.providerMessageId, item.providerError, item.simulated])];
     if (dataset === 'scores') return [['流水ID','用户ID','借用单ID','原因','变化分','余额','时间'],
       ...db.scoreEvents.map(item => [item.id, item.userId, item.loanId, item.reason, item.change, item.score, item.at])];
     if (dataset === 'damage') return [['报修ID','借用单ID','雨伞号','说明','是否有照片','上报时间'],
@@ -237,19 +310,22 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
     const port = server.address()?.port || 8766;
     const localUrl = `http://127.0.0.1:${port}/`;
     const addresses = Object.values(os.networkInterfaces()).flat().filter(item => item && item.family === 'IPv4' && !item.internal);
-    const urls = lan ? [...new Set(addresses.map(item => `http://${item.address}:${port}/`)), localUrl] : [localUrl];
+    const urls = [...(publicUrl ? [publicUrl] : []), ...(lan ? addresses.map(item => `http://${item.address}:${port}/`) : []), localUrl];
     const slots = currentUmbrellas();
-    return { now: at, rules: RULES, stages: STAGES, cabinet: CABINET, user, admin, demoUsers: DEMO_USERS,
+    return { now: at, rules: RULES, stages: STAGES, cabinet: CABINET, user: publicUser(user), admin,
+      authMode: wechatMode ? 'wechat' : 'demo', wechatTemplateId: wechatMode ? wechatAdapter.templateId : null,
+      demoControls: allowDemoControls,
+      demoUsers: wechatMode ? [] : DEMO_USERS,
       umbrellas: slots.map(item => ({ ...item })), assets: admin ? db.umbrellas.map(item => ({ ...item })) : [],
       summary: admin ? summary(at) : null, loans,
       reminders: db.reminders.filter(item => admin || (user && item.userId === user.id && item.status !== 'cancelled')).slice().reverse(),
       scoreEvents: db.scoreEvents.filter(item => admin || item.userId === user?.id).slice().reverse(),
       lockEvents: db.lockEvents.filter(item => admin || item.userId === user?.id).slice(-12).reverse(),
       deviceEvents: db.deviceEvents.filter(item => admin || (user && db.loans.find(loan => loan.id === item.loanId)?.userId === user.id)).slice(-20).reverse(),
-      users: admin ? db.users : [], maintenance: admin ? db.maintenance.slice().reverse() : [],
+      users: admin ? db.users.map(publicUser) : [], maintenance: admin ? db.maintenance.slice().reverse() : [],
       damageReports: db.damageReports.filter(item => admin || item.userId === user?.id).slice().reverse().map(publicReport),
       canBorrow: !!user && user.score >= RULES.minimumScore && !activeLoan(user.id),
-      urls, lan, simulation: { identity: true, locks: true, push: true, device: true },
+      urls, lan, simulation: { identity: !wechatMode, locks: true, push: !wechatMode, device: true },
       totals: { available: slots.filter(item => item.status === 'available').length,
         borrowed: slots.filter(item => item.status === 'borrowed').length,
         maintenance: slots.filter(item => item.status === 'maintenance').length,
@@ -338,15 +414,64 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         // Recheck time after reading the request body; a deadline may have passed while it arrived.
         applyRules();
         if (url.pathname === '/api/login') {
+          if (wechatMode) fail('请通过微信登录并完成校内身份绑定。', 403);
           const user = db.users.find(item => item.role === input.role && item.number === String(input.number || '').trim());
           const identityDetail = user?.role === 'student' ? String(input.className || '').trim() === user.className : String(input.phone || '').trim() === user?.phone;
           if (!user || String(input.name || '').trim() !== user.name || !identityDetail || input.pin !== '123456') fail('演示身份不匹配，请核对姓名、编号、班级或电话及口令。', 401);
-          const token = crypto.randomBytes(24).toString('hex');
-          sessions.set(token, { role: user.role, userId: user.id, expires: Date.now() + 24 * HOUR });
-          return json(res, 200, { token, user });
+          return json(res, 200, { token: sessionFor(user), user: publicUser(user) });
+        }
+        if (url.pathname === '/api/admin/binding-code') {
+          getActor(req, true);
+          if (!wechatMode) fail('当前未开启微信联调模式。', 409);
+          const user = db.users.find(item => item.role === input.role && item.number === String(input.number || '').trim());
+          if (!user || user.wechatOpenId) fail('名单中没有该身份，或已完成绑定。', 409);
+          const code = crypto.randomBytes(16).toString('hex');
+          user.bindCodeHash = crypto.createHash('sha256').update(code).digest('hex');
+          user.bindCodeExpires = Date.now() + HOUR;
+          save();
+          return json(res, 200, { code, expiresAt: user.bindCodeExpires, user: publicUser(user) });
+        }
+        if (url.pathname === '/api/wechat/login') {
+          if (!wechatMode) fail('当前未开启微信联调模式。', 409);
+          const loginCode = String(input.code || '');
+          if (!loginCode || loginCode.length > 256) fail('微信登录凭证不正确。');
+          const { openid } = await wechatAdapter.exchangeCode(loginCode);
+          const user = db.users.find(item => item.wechatOpenId === openid);
+          if (!user) fail('微信账号尚未绑定校内身份。', 409);
+          return json(res, 200, { token: sessionFor(user), user: publicUser(user) });
+        }
+        if (url.pathname === '/api/wechat/bind') {
+          if (!wechatMode) fail('当前未开启微信联调模式。', 409);
+          const user = db.users.find(item => item.role === input.role && item.number === String(input.number || '').trim());
+          const detail = user?.role === 'student' ? String(input.className || '').trim() === user.className :
+            String(input.phone || '').trim() === user?.phone;
+          const bindingCode = String(input.bindingCode || '').trim();
+          const hash = crypto.createHash('sha256').update(bindingCode).digest('hex');
+          if (!user || user.wechatOpenId || !detail || String(input.name || '').trim() !== user.name ||
+              !user.bindCodeHash || user.bindCodeHash !== hash || Date.now() > user.bindCodeExpires)
+            fail('身份或一次性绑定码不正确、已使用或已过期。', 401);
+          const loginCode = String(input.code || '');
+          if (!loginCode || loginCode.length > 256) fail('微信登录凭证不正确。');
+          const { openid } = await wechatAdapter.exchangeCode(loginCode);
+          if (db.users.some(item => item.wechatOpenId === openid)) fail('这个微信账号已绑定其他校内身份。', 409);
+          user.wechatOpenId = openid;
+          delete user.bindCodeHash; delete user.bindCodeExpires;
+          save();
+          return json(res, 200, { token: sessionFor(user), user: publicUser(user) });
+        }
+        if (url.pathname === '/api/wechat/subscription') {
+          if (!wechatMode) fail('当前未开启微信联调模式。', 409);
+          const user = getUser(req);
+          const loan = activeLoan(user.id);
+          if (!loan || loan.status === 'pendingPickup' || loan.id !== input.loanId) fail('请先确认取伞，再订阅归还提醒。', 409);
+          if (input.templateId !== wechatAdapter.templateId || input.accepted !== true)
+            fail('未获得当前提醒模板的订阅同意。');
+          loan.subscriptionCredits = Math.min(3, (loan.subscriptionCredits || 0) + 1);
+          save(); return json(res, 200, { ok: true, remaining: loan.subscriptionCredits,
+            message: '已记录本次订阅同意；是否成功送达以微信接口结果为准。' });
         }
         if (url.pathname === '/api/admin/login') {
-          if (input.pin !== '2026') fail('管理员演示口令不正确。', 401);
+          if (input.pin !== adminPin) fail('管理员口令不正确。', 401);
           const token = crypto.randomBytes(24).toString('hex');
           sessions.set(token, { role: 'admin', expires: Date.now() + 24 * HOUR });
           return json(res, 200, { token });
@@ -527,6 +652,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         }
         if (url.pathname === '/api/demo/advance') {
           getActor(req, true);
+          if (!allowDemoControls) fail('微信联调模式不能快进时间。', 403);
           const hours = Number(input.hours);
           if (!Number.isFinite(hours) || hours <= 0 || hours > 168) fail('每次可推进0到168小时之间的时间。');
           db.offsetMs += hours * HOUR;
@@ -536,9 +662,10 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
         }
         if (url.pathname === '/api/demo/reset') {
           getActor(req, true);
+          if (!allowDemoControls) fail('微信联调模式不能重置数据。', 403);
           if (input.confirm !== 'RESET') fail('请确认重置实验。');
           const oldPhotos = db.damageReports.map(item => item.photoFile).filter(Boolean);
-          db = seed();
+          db = seed(approvedRoster);
           save();
           for (const filename of oldPhotos) fs.rmSync(path.join(photoDir, filename), { force: true });
           return json(res, 200, { ok: true });
@@ -557,23 +684,47 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlit
       else res.end();
     }
   });
-  const timer = setInterval(() => { try { applyRules(); } catch (error) { console.error('提醒检查失败：', error.message); } }, 1000);
+  const timer = setInterval(() => {
+    try { applyRules(); processWeChatReminders().catch(error => console.error('微信提醒处理失败：', error.message)); }
+    catch (error) { console.error('提醒检查失败：', error.message); }
+  }, 1000);
   timer.unref();
   server.on('close', () => { clearInterval(timer); store.close(); });
+  server.processWeChatReminders = processWeChatReminders;
   return server;
 }
 
 if (require.main === module) {
   const lan = process.argv.includes('--lan');
   const port = Number(process.env.UMBRELLA_PORT || 8766);
-  const server = createDemoServer({ lan });
+  const env = process.env;
+  const configured = [env.WECHAT_APP_ID, env.WECHAT_APP_SECRET, env.WECHAT_TEMPLATE_ID,
+    env.WECHAT_TEMPLATE_DATA_JSON, env.UMBRELLA_ROSTER_FILE, env.UMBRELLA_ADMIN_PIN,
+    env.UMBRELLA_PUBLIC_URL].some(Boolean);
+  let options = { lan };
+  if (configured) {
+    const required = ['WECHAT_APP_ID','WECHAT_APP_SECRET','WECHAT_TEMPLATE_ID','WECHAT_TEMPLATE_DATA_JSON',
+      'UMBRELLA_ROSTER_FILE','UMBRELLA_ADMIN_PIN','UMBRELLA_PUBLIC_URL'];
+    const missing = required.filter(key => !env[key]);
+    if (missing.length) throw new Error(`微信联调配置不完整：${missing.join(', ')}`);
+    const roster = JSON.parse(fs.readFileSync(env.UMBRELLA_ROSTER_FILE, 'utf8'));
+    const templateData = JSON.parse(env.WECHAT_TEMPLATE_DATA_JSON);
+    options = { lan, dataFile: path.join(__dirname, 'data', 'wechat.sqlite'), roster,
+      publicUrl: env.UMBRELLA_PUBLIC_URL,
+      adminPin: env.UMBRELLA_ADMIN_PIN,
+      wechatAdapter: createWechatAdapter({ appId: env.WECHAT_APP_ID, appSecret: env.WECHAT_APP_SECRET,
+        templateId: env.WECHAT_TEMPLATE_ID, templateData,
+        miniprogramState: env.WECHAT_MINIPROGRAM_STATE || 'formal' }) };
+  }
+  const server = createDemoServer(options);
   server.on('error', error => {
     console.error(error.code === 'EADDRINUSE' ? `端口${port}已被使用。若演示已经打开，可继续使用原窗口。` : error.message);
     process.exitCode = 1;
   });
   server.listen(port, lan ? '0.0.0.0' : '127.0.0.1', () => {
     console.log(`校园爱心伞实验已启动：http://127.0.0.1:${port}/`);
-    console.log('演示身份口令：123456；管理员口令：2026。关闭此窗口停止服务。');
+    console.log(configured ? '微信联调模式：校内身份需一次性绑定码；服务尚使用模拟柜锁。' :
+      '演示身份口令：123456；管理员口令：2026。关闭此窗口停止服务。');
     console.log(lan ? '已启用同一局域网手机演示。页面二维码处可选择本机网络地址。' : '当前仅本机访问。手机演示请使用“启动手机演示.cmd”。');
   });
 }

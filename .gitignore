@@ -1,5 +1,6 @@
 node_modules/
 data/
+config/*.private.json
 verification/
 *.log
 miniprogram/project.private.config.json

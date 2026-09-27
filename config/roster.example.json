@@ -1,0 +1,4 @@
+[
+  { "id": "student-example", "role": "student", "number": "S2026001", "name": "演示同学一", "className": "高二（1）班" },
+  { "id": "teacher-example", "role": "teacher", "number": "T0001", "name": "演示老师", "phone": "00000000000" }
+]

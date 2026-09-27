@@ -101,6 +101,7 @@ async function loadReportPhotos() {
 }
 function accountPanel() {
   if (!state.user) {
+    if (state.authMode === 'wechat') return '<aside class="identity-panel"><h3>微信校内身份登录</h3><p>请使用微信小程序完成登录和一次性校内身份绑定。网页只用于查看库存与管理员操作。</p><p class="hint">当前柜锁仍为实验模拟。</p></aside>';
     const selected = state.demoUsers[selectedAccount] || state.demoUsers[0];
     return `<aside class="identity-panel"><h3>先认识一下你</h3><p class="hint">使用虚构校内名单，模拟实名身份核验。<br>不采集真实学籍或个人信息。</p>
       <div class="segmented">${state.demoUsers.map((user, index) => `<button data-account="${index}" class="${index === selectedAccount ? 'selected' : ''}">${user.role === 'teacher' ? '教师' : '学生' + (index + 1)}</button>`).join('')}</div>
@@ -132,25 +133,30 @@ function recordList(loans) {
   return loans.length ? loans.map(loan => `<article class="record"><div class="record-top"><strong>${loan.umbrellaId}号雨伞</strong><span class="tag ${loan.overdue ? 'overdue' : ''}">${loan.status === 'cancelled' ? '取伞超时取消' : loan.status === 'exception' ? '异常已结案' : loan.status === 'pendingPickup' ? '等待取伞' : loan.status === 'returnPending' ? '归还待检测' : loan.returnedAt ? (loan.onTime ? '按时归还' : '逾期已归还') : loan.overdue ? '逾期未还' : '借用中'}</span></div><p>${loan.userName ? escapeHtml(loan.userName) + '　' : ''}借出：${stamp(loan.borrowedAt)}<br>应还：${stamp(loan.dueAt)}${loan.returnedAt ? '<br>归还：' + stamp(loan.returnedAt) : ''}${loan.damaged ? '<br>已报修，归还后转待维修。' : ''}</p></article>`).join('') : '<p class="empty">还没有借还记录。<br>借出第一把伞后，这里会记下它的旅程。</p>';
 }
 function reminderList() {
-  return state.reminders.length ? state.reminders.map(item => `<article class="record"><div class="record-top"><strong>${escapeHtml(item.stage)}</strong><small>${stamp(item.at)}</small></div><p>${item.umbrellaId}号伞：${escapeHtml(item.text)}</p><small>站内消息 · 模拟推送</small></article>`).join('') : '<p class="empty">暂时没有归还提醒。<br>借伞后可在实验控制台推进时间查看。</p>';
+  const delivery = { simulated: '站内消息 · 模拟推送', pending: '微信提醒待处理', attempted: '已尝试发送，结果未确认', accepted: '微信接口已受理，送达与已读未知',
+    failed: '微信接口发送失败', not_authorized: '未获得本次订阅授权，仅站内记录', superseded: '已有更新提醒，本次未外发', cancelled: '已取消' };
+  return state.reminders.length ? state.reminders.map(item => `<article class="record"><div class="record-top"><strong>${escapeHtml(item.stage)}</strong><small>${stamp(item.at)}</small></div><p>${item.umbrellaId}号伞：${escapeHtml(item.text)}</p><small>${delivery[item.deliveryStatus] || '站内消息'}</small></article>`).join('') : '<p class="empty">暂时没有归还提醒。<br>借伞后可在实验控制台推进时间查看。</p>';
 }
 function recordsView() {
   if (!state.user) return '<div class="section-panel empty">请先在“借还雨伞”中完成演示身份认证。</div>';
-  return `<div class="records-layout"><section class="section-panel"><h2>我的借还记录</h2>${recordList(state.loans)}<h3 class="subheading">我的报修</h3>${state.damageReports.length ? state.damageReports.map(reportCard).join('') : '<p class="empty">暂无报修记录。</p>'}<h3 class="subheading">积分明细</h3>${state.scoreEvents.length ? state.scoreEvents.map(item => `<div class="record"><div class="record-top"><span>${escapeHtml(item.reason)}</span><strong>${item.change >= 0 ? '+' : ''}${item.change}</strong></div><p>${stamp(item.at)}　积分余额：${item.score}</p></div>`).join('') : '<p class="empty">暂时没有积分变动。</p>'}</section><section class="section-panel"><h2>归还提醒</h2><p class="hint">本页展示分级提醒的实验效果，不会发送微信通知或短信。</p>${reminderList()}</section></div>`;
+  return `<div class="records-layout"><section class="section-panel"><h2>我的借还记录</h2>${recordList(state.loans)}<h3 class="subheading">我的报修</h3>${state.damageReports.length ? state.damageReports.map(reportCard).join('') : '<p class="empty">暂无报修记录。</p>'}<h3 class="subheading">积分明细</h3>${state.scoreEvents.length ? state.scoreEvents.map(item => `<div class="record"><div class="record-top"><span>${escapeHtml(item.reason)}</span><strong>${item.change >= 0 ? '+' : ''}${item.change}</strong></div><p>${stamp(item.at)}　积分余额：${item.score}</p></div>`).join('') : '<p class="empty">暂时没有积分变动。</p>'}</section><section class="section-panel"><h2>归还提醒</h2><p class="hint">${state.authMode === 'wechat' ? '站内记录与微信接口结果分别显示；接口受理不代表送达或已读。' : '本页展示分级提醒的实验效果，不会发送微信通知或短信。'}</p>${reminderList()}</section></div>`;
 }
 function adminView() {
   if (!state.admin) return '<div class="section-panel empty">请使用管理员演示口令进入。</div>';
   const overdue = state.loans.filter(item => item.overdue);
   const summary = state.summary;
   const rate = summary.maturedCount ? `${Math.round(summary.returnedMaturedCount / summary.maturedCount * 100)}%` : '样本不足';
-  return `<div class="metrics">${[['可借雨伞', state.totals.available], ['已借出', state.totals.borrowed], ['逾期未还', overdue.length], ['待修 / 遗失', state.totals.maintenance + ' / ' + state.totals.lost]].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join('')}</div>
+  const bindingPanel = state.authMode === 'wechat' ? `<section class="section-panel"><h2>校内身份绑定码</h2><p class="hint">核对校内名单后发放给本人；有效期1小时，页面只显示一次。请勿在此填写真实师生资料以外的名单。</p>${state.users.map(user => `<div class="record"><strong>${escapeHtml(user.name)} · ${escapeHtml(user.number)}</strong><span class="tag">${user.wechatBound ? '已绑定' : '未绑定'}</span>${user.wechatBound ? '' : `<button data-binding="${escapeHtml(user.number)}" data-role="${escapeHtml(user.role)}">生成绑定码</button>`}</div>`).join('')}</section>` : '';
+  return `${bindingPanel}<div class="metrics">${[['可借雨伞', state.totals.available], ['已借出', state.totals.borrowed], ['逾期未还', overdue.length], ['待修 / 遗失', state.totals.maintenance + ' / ' + state.totals.lost]].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join('')}</div>
     <section class="section-panel"><h2>课题观察数据</h2><p>截至 ${stamp(summary.cutoffAt)}，已确认借出 ${summary.borrowedCount} 次，其中借期已到 ${summary.maturedCount} 次，已归还 ${summary.returnedMaturedCount} 次；到期样本归还率 ${rate}。按时归还 ${summary.onTimeMaturedCount} 次，未结 ${summary.openCount} 次，报修 ${summary.damageCount} 次。</p><p class="hint">只用已到期借用单计算归还率；样本量很小时不宜据此判断积分机制的效果。导出文件使用用户内部编号，不含姓名、电话或照片。</p><div class="button-row">${[['summary','统计概览'],['loans','借还记录'],['reminders','提醒记录'],['scores','积分流水'],['damage','报修记录'],['inventory','库存历史'],['maintenance','维修补货'],['devices','设备事件']].map(([id,label]) => `<button data-export="${id}">导出${label} CSV</button>`).join('')}</div></section>
+    <section class="section-panel"><h2>提醒处理记录</h2><p class="hint">微信接口“已受理”不等于送达或已读；未授权、失败会分别记录。</p>${reminderList()}</section>
     <section class="section-panel"><h2>雨伞与仓位管理</h2><p class="hint">正常借还由师生自助完成；管理员只处理维修、盘点遗失、补货和无法完成归还的异常。每次处理都需填写说明。</p><div class="table-wrap"><table><thead><tr><th>雨伞</th><th>仓位</th><th>当前状态</th><th>异常处理</th></tr></thead><tbody>${state.umbrellas.map(item => `<tr><td>${item.id}号伞</td><td>${item.slotId}号仓位</td><td>${statusText[item.status]}</td><td>${['borrowed', 'pendingPickup'].includes(item.status) ? '借用流程中' : `<button data-manage="${item.id}">调整状态</button>${['lost','retired'].includes(item.status) ? `<button data-replenish="${item.slotId}">补入新伞</button>` : ''}`}</td></tr>`).join('')}</tbody></table></div></section>
     <div class="admin-grid"><section class="section-panel"><h2>逾期名单</h2>${recordList(overdue)}</section><section class="section-panel"><h2>用户积分</h2>${state.users.map(user => `<div class="record"><div class="record-top"><strong>${escapeHtml(user.name)}</strong><span class="tag ${user.score < 60 ? 'overdue' : ''}">${user.score}分</span></div><p>${user.role === 'teacher' ? '教师' : '学生'}　${escapeHtml(user.number)}${user.score < 60 ? '　借用权限受限' : ''}</p></div>`).join('')}</section></div>
     <section class="section-panel"><h2>全部借还记录</h2>${state.loans.length ? state.loans.map(loan => `<div class="record"><div class="record-top"><strong>${escapeHtml(loan.userName)} · ${loan.umbrellaId}号伞</strong><span class="tag ${loan.overdue ? 'overdue' : ''}">${loan.status === 'exception' ? '异常已结案' : loan.status === 'returned' ? '已归还' : loan.status === 'cancelled' ? '取伞超时取消' : loan.overdue ? '逾期未还' : loan.status === 'returnPending' ? '归还待检测' : '借用中'}</span></div><p>仓位 ${loan.slotId} · 应还 ${stamp(loan.dueAt)}${loan.faultNote ? '<br>设备故障：' + escapeHtml(loan.faultNote) : ''}${loan.exceptionNote ? '<br>结案说明：' + escapeHtml(loan.exceptionNote) : ''}</p>${['borrowed','returnPending'].includes(loan.status) ? `<button data-exception="${loan.id}">核实后异常结案</button>` : ''}</div>`).join('') : '<p class="empty">暂无借还记录。</p>'}</section><div class="admin-grid"><section class="section-panel"><h2>模拟开锁记录</h2>${state.lockEvents.length ? state.lockEvents.map(item => `<div class="record"><div class="record-top"><strong>${item.slotId}号仓位 · ${item.purpose === 'borrow' ? '借伞开锁' : '归还开锁'}</strong><span class="tag muted">模拟</span></div><p>${stamp(item.at)}　对应${item.umbrellaId}号伞</p></div>`).join('') : '<p class="empty">借还操作后生成开锁记录。</p>'}</section><section class="section-panel"><h2>报修照片与说明</h2>${state.damageReports.length ? state.damageReports.map(reportCard).join('') : '<p class="empty">暂时没有报修记录。</p>'}</section></div><section class="section-panel"><h2>维修与补货记录</h2>${state.maintenance.length ? state.maintenance.map(item => `<div class="record"><strong>${item.umbrellaId}号伞 · ${item.status === 'replenished' ? '补入新伞' : statusText[item.status]}</strong><p>${stamp(item.at)} · ${escapeHtml(item.note)}${item.previousUmbrellaId ? ` · 替换旧${item.previousUmbrellaId}号伞` : ''}</p></div>`).join('') : '<p class="empty">暂无维修或补货记录。</p>'}</section>`;
 }
 function render() {
   renderedTab = tab;
+  $('.experiment-panel').hidden = !state.demoControls;
   photoUrls.forEach(URL.revokeObjectURL);
   photoUrls = [];
   $('#app').innerHTML = tab === 'cabinet' ? cabinetView() : tab === 'records' ? recordsView() : adminView();
@@ -164,7 +170,7 @@ function withAdmin(callback) {
     if (error.status === 401) { saveToken('admin', ''); withAdmin(callback); }
     else toast(error.message);
   });
-  modal('<h2>管理员演示身份</h2><p>管理后台与实验控制台使用同一个演示口令。</p><form id="admin-login"><label for="admin-pin">管理员口令</label><input id="admin-pin" class="field" name="pin" value="2026" required autocomplete="off"><p class="error" id="admin-error"></p><div class="dialog-actions"><button type="button" data-close>取消</button><button class="primary" type="submit">进入</button></div></form>');
+  modal(`<h2>管理员身份</h2><p>管理后台与实验控制台使用同一个口令。</p><form id="admin-login"><label for="admin-pin">管理员口令</label><input id="admin-pin" class="field" name="pin" value="${state?.authMode === 'demo' ? '2026' : ''}" required autocomplete="off"><p class="error" id="admin-error"></p><div class="dialog-actions"><button type="button" data-close>取消</button><button class="primary" type="submit">进入</button></div></form>`);
   $('#admin-login').addEventListener('submit', async event => {
     event.preventDefault();
     const button = event.submitter;
@@ -268,6 +274,10 @@ document.addEventListener('click', async event => {
     }
     if (button.hasAttribute('data-return')) { button.disabled = true; await openReturn(button.dataset.return); button.disabled = false; return; }
     if (button.hasAttribute('data-report')) return openDamageReport(button.dataset.report);
+    if (button.hasAttribute('data-binding')) {
+      const result = await api('/api/admin/binding-code', { role: button.dataset.role, number: button.dataset.binding }, tokens.admin);
+      return modal(`<h2>一次性绑定码</h2><p>${escapeHtml(result.user.name)} · ${escapeHtml(result.user.number)}</p><p class="binding-code">${escapeHtml(result.code)}</p><p>请核对身份后交给本人。此码仅显示一次，1小时内有效。</p><div class="dialog-actions"><button data-close>关闭</button></div>`);
+    }
     if (button.hasAttribute('data-fault')) {
       const loanId = button.dataset.fault;
       modal('<h2>登记仓位故障</h2><p>无法正常归还时，请说明情况。实验中会暂停后续自动扣分，并由管理员核查；雨伞仍在你的借用记录中。</p><form id="fault-form"><label for="fault-note">故障说明</label><textarea id="fault-note" name="note" class="field" minlength="2" maxlength="300" rows="3" required placeholder="例如：仓门无法打开，无法放入雨伞"></textarea><p class="error" id="fault-error"></p><div class="dialog-actions"><button type="button" data-close>取消</button><button class="primary" type="submit">登记故障</button></div></form>');

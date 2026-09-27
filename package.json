@@ -5,7 +5,7 @@
   "description": "校园爱心伞实验原型",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test.js"
+    "test": "node --test test.js wechat.test.js"
   },
   "engines": { "node": ">=24" },
   "dependencies": { "qrcode": "1.5.4" }

@@ -10,7 +10,7 @@ const stamp = value => {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 Page({
-  data: { tab: 'cabinet', account: accounts[0], pin: '123456', accountIndex: 0, state: null, busy: false, currentLoan: null, connected: false, error: '', adminPin: '2026', adminReady: false, scanResult: '', adminNote: '', faultNote: '',
+  data: { tab: 'cabinet', account: accounts[0], pin: '123456', bindingCode: '', accountIndex: 0, state: null, busy: false, currentLoan: null, connected: false, error: '', adminPin: '2026', adminReady: false, scanResult: '', adminNote: '', faultNote: '', issuedBindingCode: '',
     damageMode: '', damageNote: '', damagePhotoPath: '', damageFlag: false, returnConfirmed: false },
   onLoad() { this.refresh(); },
   onShow() { this.timer = setInterval(() => { if (!this.data.busy) this.refresh(); }, 5000); },
@@ -37,14 +37,31 @@ Page({
     try {
       const admin = this.data.tab === 'admin' && !!wx.getStorageSync('umbrella-admin');
       const state = await this.request('/api/state', undefined, admin);
+      if (state.authMode === 'wechat' && !this.wechatInitialized) {
+        this.wechatInitialized = true;
+        this.setData({ account: { role: 'student', name: '', number: '', className: '', phone: '' }, adminPin: '' });
+      }
       state.umbrellas = state.umbrellas.map(item => ({ ...item, statusText: statuses[item.status] }));
       state.loans = state.loans.map(item => ({ ...item, borrowedText: stamp(item.borrowedAt), dueText: stamp(item.dueAt), returnedText: item.returnedAt ? stamp(item.returnedAt) : '', statusText: item.status === 'pendingPickup' ? '待取伞' : item.status === 'cancelled' ? '取伞超时取消' : item.status === 'exception' ? '异常已结案' : item.status === 'returnPending' ? '归还待检测' : item.returnedAt ? '已归还' : item.overdue ? '逾期未还' : '借用中' }));
-      state.reminders = state.reminders.map(item => ({ ...item, timeText: stamp(item.at) }));
+      const delivery = { simulated: '站内模拟', pending: '待处理', attempted: '尝试发送中', accepted: '微信接口已受理，送达未知',
+        failed: '微信发送失败', not_authorized: '未订阅，仅站内记录', superseded: '被更新提醒取代', cancelled: '已取消' };
+      state.reminders = state.reminders.map(item => ({ ...item, timeText: stamp(item.at), deliveryText: delivery[item.deliveryStatus] || '站内记录' }));
       state.damageReports = state.damageReports.map(item => ({ ...item, timeText: stamp(item.updatedAt), statusText: item.returned ? '已归还，待维修' : '借用中，已报修' }));
       this.setData({ state, connected: true, currentLoan: state.loans.find(item => ['pendingPickup', 'borrowed', 'returnPending'].includes(item.status)) || null, nowText: stamp(state.now), overdue: state.loans.filter(item => item.overdue), adminReady: !!wx.getStorageSync('umbrella-admin') });
     } catch (error) { this.setData({ error: error.message, connected: false }); }
   },
   selectAccount(event) { const index = Number(event.currentTarget.dataset.index); this.setData({ accountIndex: index, account: { ...accounts[index] } }); },
+  selectRole(event) { this.setData({ 'account.role': event.currentTarget.dataset.role }); },
+  wxCode() { return new Promise((resolve, reject) => wx.login({ success: result => result.code ? resolve(result.code) : reject(new Error('微信未返回登录凭证。')), fail: reject })); },
+  wechatLogin() { this.run(async () => {
+    const result = await this.request('/api/wechat/login', { code: await this.wxCode() });
+    wx.setStorageSync('umbrella-user', result.token); await this.refresh();
+  }); },
+  bindWechat() { this.run(async () => {
+    const result = await this.request('/api/wechat/bind', { ...this.data.account,
+      bindingCode: this.data.bindingCode.trim(), code: await this.wxCode() });
+    wx.setStorageSync('umbrella-user', result.token); this.setData({ bindingCode: '' }); await this.refresh();
+  }); },
   scanLabel() {
     this.run(async () => {
       const result = await new Promise((resolve, reject) => wx.scanCode({ onlyFromCamera: false, success: resolve, fail: reject }));
@@ -59,6 +76,16 @@ Page({
   },
   input(event) { this.setData({ [event.currentTarget.dataset.field]: event.detail.value }); },
   login() { this.run(async () => { const result = await this.request('/api/login', { ...this.data.account, pin: this.data.pin }); wx.setStorageSync('umbrella-user', result.token); await this.refresh(); }); },
+  subscribeReminder() { this.run(async () => {
+    const templateId = this.data.state.wechatTemplateId;
+    const loan = this.data.currentLoan;
+    if (!templateId || !loan || loan.status === 'pendingPickup') throw new Error('请先确认取伞。');
+    const result = await new Promise((resolve, reject) => wx.requestSubscribeMessage({ tmplIds: [templateId], success: resolve, fail: reject }));
+    if (result[templateId] !== 'accept' && result[templateId] !== 'acceptWithAudio')
+      return wx.showToast({ title: '未同意订阅，仍可在记录页查看站内提醒。', icon: 'none' });
+    const saved = await this.request('/api/wechat/subscription', { loanId: loan.id, templateId, accepted: true });
+    await this.refresh(); wx.showToast({ title: saved.message, icon: 'none' });
+  }); },
   logout() { this.run(async () => { await this.request('/api/logout', {}); wx.removeStorageSync('umbrella-user'); await this.refresh(); }); },
   changeTab(event) { this.setData({ tab: event.currentTarget.dataset.tab }); this.refresh(); },
   borrow(event) { this.run(async () => {
@@ -136,6 +163,10 @@ Page({
     wx.previewImage({ urls: [result.tempFilePath] });
   }); },
   adminLogin() { this.run(async () => { const result = await this.request('/api/admin/login', { pin: this.data.adminPin }); wx.setStorageSync('umbrella-admin', result.token); this.setData({ adminReady: true }); await this.refresh(); }); },
+  issueBindingCode(event) { this.run(async () => {
+    const result = await this.request('/api/admin/binding-code', { role: event.currentTarget.dataset.role, number: event.currentTarget.dataset.number }, true);
+    this.setData({ issuedBindingCode: `${result.user.name}：${result.code}（1小时内有效，仅显示一次）` });
+  }); },
   advance(event) { this.run(async () => { await this.request('/api/demo/advance', { hours: Number(event.currentTarget.dataset.hours) }, true); await this.refresh(); wx.showToast({ title: '实验时间已推进', icon: 'none' }); }); },
   changeStatus(event) { this.run(async () => {
     const note = this.data.adminNote.trim();
