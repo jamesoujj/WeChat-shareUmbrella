@@ -5,13 +5,16 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const QRCode = require('qrcode');
+const { openStore } = require('./lib/store');
 
 const HOUR = 3600000;
-const RULES = { borrowHours: 168, initialScore: 100, minimumScore: 60, maximumScore: 120, onTimeReward: 5 };
+const DAY = 24 * HOUR;
+const RULES = { borrowHours: 48, initialScore: 100, minimumScore: 60, maximumScore: 120,
+  onTimeReward: 2, overduePenaltyPerDay: 10, restoreScore: 70, pickupSeconds: 60, stableSeconds: 3 };
 const STAGES = [
-  { hours: 168, penalty: 10, label: '借用满7天', text: '您借用的爱心伞已满7天，尚未归还，请尽快放回对应仓位。' },
-  { hours: 192, penalty: 10, label: '逾期1天', text: '雨伞已逾期1天，请尽快归还，让下一位同学也能借到。' },
-  { hours: 240, penalty: 30, label: '逾期3天', text: '雨伞已逾期3天，请归还雨伞以恢复借用权限。' }
+  { hours: 24, label: '借出24小时', text: '您借用的爱心伞尚未归还，请留意归还时间。' },
+  { hours: 72, label: '逾期1天', text: '您借用的爱心伞已经逾期，请尽快放回对应仓位。' },
+  { hours: 120, label: '逾期3天', text: '爱心伞已逾期3天，请尽快归还。' }
 ];
 const DEMO_USERS = [
   { id: 'student-1', role: 'student', number: 'S2026001', name: '演示同学一', className: '高二（1）班' },
@@ -21,60 +24,57 @@ const DEMO_USERS = [
 
 function seed() {
   return {
-    version: 1, offsetMs: 0,
+    version: 2, offsetMs: 0,
     users: DEMO_USERS.map(user => ({ ...user, score: RULES.initialScore })),
     umbrellas: Array.from({ length: 6 }, (_, index) => ({ id: index + 1, slotId: index + 1, status: 'available' })),
-    loans: [], reminders: [], scoreEvents: [], lockEvents: [], maintenance: [], damageReports: []
+    loans: [], reminders: [], scoreEvents: [], lockEvents: [], maintenance: [], damageReports: [], deviceEvents: []
   };
 }
 
-function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'), lan = false } = {}) {
-  // ponytail: one local process and a tiny JSON file; use SQLite if multiple server processes are ever needed.
-  fs.mkdirSync(path.dirname(dataFile), { recursive: true });
-  let db = fs.existsSync(dataFile) ? JSON.parse(fs.readFileSync(dataFile, 'utf8')) : seed();
-  if (db.version !== 1 || !Array.isArray(db.users) || !Array.isArray(db.loans)) throw new Error('实验数据格式不正确，请先备份 data/state.json。');
-  db.damageReports ||= [];
+function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.sqlite'), lan = false } = {}) {
+  const store = openStore(dataFile, seed);
+  let db = store.read();
   const photoDir = path.join(path.dirname(dataFile), 'photos');
   const sessions = new Map();
   const now = () => Date.now() + db.offsetMs;
   const save = () => {
-    const temporaryFile = dataFile + '.' + crypto.randomUUID() + '.tmp';
-    fs.writeFileSync(temporaryFile, JSON.stringify(db, null, 2), 'utf8');
-    try {
-      for (let attempt = 0; attempt < 10; attempt++) {
-        try { fs.renameSync(temporaryFile, dataFile); break; }
-        catch (error) {
-          if (!['EPERM', 'EACCES'].includes(error.code) || attempt === 9) throw error;
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-        }
-      }
-    } finally { if (fs.existsSync(temporaryFile)) fs.unlinkSync(temporaryFile); }
+    try { store.write(db); }
+    catch (error) { db = store.read(); throw error; }
   };
-  if (!fs.existsSync(dataFile)) save();
   function fail(message, status = 400) { throw Object.assign(new Error(message), { status }); }
-  function changeScore(user, change, reason, loanId, at) {
+  function changeScore(user, change, reason, loanId, at, day = null) {
     const before = user.score;
     user.score = Math.max(0, Math.min(RULES.maximumScore, before + change));
-    db.scoreEvents.push({ id: crypto.randomUUID(), userId: user.id, loanId, at, change: user.score - before, reason, score: user.score });
+    db.scoreEvents.push({ id: crypto.randomUUID(), userId: user.id, loanId, at, day,
+      change: user.score - before, reason, score: user.score });
   }
   function applyRules() {
     const at = now();
     let changed = false;
-    for (const loan of db.loans.filter(item => !item.returnedAt)) {
+    for (const loan of db.loans) {
+      if (loan.status === 'pendingPickup' && at >= loan.reservedUntil) {
+        loan.status = 'cancelled'; loan.closedAt = at;
+        const umbrella = db.umbrellas.find(item => item.id === loan.umbrellaId);
+        if (umbrella.status === 'pendingPickup') umbrella.status = 'available';
+        changed = true;
+      }
+      if (!['borrowed', 'returnPending'].includes(loan.status)) continue;
       const user = db.users.find(item => item.id === loan.userId);
+      const effectiveAt = loan.penaltyFrozenAt ? Math.min(at, loan.penaltyFrozenAt) : at;
       for (const stage of STAGES) {
-        if (at >= loan.borrowedAt + stage.hours * HOUR && !loan.reminded.includes(stage.hours)) {
+        if (effectiveAt >= loan.borrowedAt + stage.hours * HOUR && !loan.reminded.includes(stage.hours)) {
           db.reminders.push({ id: crypto.randomUUID(), userId: user.id, loanId: loan.id, umbrellaId: loan.umbrellaId,
-            at, scheduledAt: loan.borrowedAt + stage.hours * HOUR, stage: stage.label, text: stage.text, simulated: true });
+            at, scheduledAt: loan.borrowedAt + stage.hours * HOUR, stage: stage.label, text: stage.text,
+            status: 'recorded', simulated: true });
           loan.reminded.push(stage.hours);
           changed = true;
         }
-        // Exactly at the deadline, remind first; a loan becomes overdue only after its deadline.
-        if (at > loan.borrowedAt + stage.hours * HOUR && !loan.penalized.includes(stage.hours)) {
-          changeScore(user, -stage.penalty, stage.label + '未归还', loan.id, at);
-          loan.penalized.push(stage.hours);
-          changed = true;
-        }
+      }
+      const elapsedDays = Math.max(0, Math.floor((effectiveAt - loan.dueAt) / DAY));
+      for (let day = loan.penalizedDays + 1; day <= elapsedDays; day++) {
+        changeScore(user, -RULES.overduePenaltyPerDay, '逾期扣分', loan.id, at, day);
+        loan.penalizedDays = day;
+        changed = true;
       }
     }
     if (changed) save();
@@ -98,7 +98,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
     if (!user) fail('请先选择学生或教师身份。', 403);
     return user;
   }
-  const activeLoan = userId => db.loans.find(loan => loan.userId === userId && !loan.returnedAt);
+  const activeLoan = userId => db.loans.find(loan => loan.userId === userId && ['pendingPickup', 'borrowed', 'returnPending'].includes(loan.status));
   function decodePhoto(value) {
     if (value === undefined || value === null || value === '') return null;
     if (typeof value !== 'string' || value.length > 2100000) fail('照片过大，请选择不超过1.5MB的照片。', 413);
@@ -138,6 +138,35 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
     userName: db.users.find(item => item.id === report.userId)?.name, at: report.at, updatedAt: report.updatedAt,
     description: report.description, hasPhoto: !!report.photoFile,
     returned: !!db.loans.find(item => item.id === report.loanId)?.returnedAt });
+  function recordDevice(loan, type, at, detail = {}) {
+    const event = { id: crypto.randomUUID(), loanId: loan?.id || null, umbrellaId: loan?.umbrellaId || null,
+      at, type, simulated: true, ...detail };
+    db.deviceEvents.push(event);
+    return event;
+  }
+  function finalizeReturn(loan, observedAt) {
+    const user = db.users.find(item => item.id === loan.userId);
+    const validDays = Math.max(0, Math.floor((observedAt - loan.dueAt) / DAY));
+    if (loan.penalizedDays > validDays) {
+      const refund = db.scoreEvents.filter(event => event.loanId === loan.id && event.reason === '逾期扣分' &&
+        event.day > validDays && !event.reversedAt).reduce((total, event) => {
+        event.reversedAt = now();
+        return total - event.change;
+      }, 0);
+      if (refund) changeScore(user, refund, '设备事件补传校正', loan.id, now());
+      loan.penalizedDays = validDays;
+    }
+    loan.status = 'returned'; loan.returnedAt = observedAt; loan.onTime = observedAt <= loan.dueAt;
+    loan.damaged = loan.returnIntent.damaged;
+    const umbrella = db.umbrellas.find(item => item.id === loan.umbrellaId);
+    umbrella.status = loan.damaged ? 'maintenance' : 'available';
+    if (loan.onTime) changeScore(user, RULES.onTimeReward, '按时归还奖励', loan.id, observedAt);
+    if (user.score < RULES.minimumScore) changeScore(user, RULES.restoreScore - user.score, '归还后恢复借用权限', loan.id, observedAt);
+    if (loan.damaged) db.maintenance.push({ id: crypto.randomUUID(), at: observedAt, umbrellaId: umbrella.id,
+      status: 'maintenance', note: db.damageReports.find(item => item.loanId === loan.id)?.description || '归还时报告损坏' });
+    for (const reminder of db.reminders.filter(item => item.loanId === loan.id && item.scheduledAt >= observedAt))
+      reminder.status = 'cancelled';
+  }
   function view(req) {
     let actor;
     if (req.headers.authorization) actor = getActor(req);
@@ -145,7 +174,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
     const user = db.users.find(item => item.id === actor?.userId) || null;
     const at = now();
     const loans = db.loans.filter(loan => admin || loan.userId === user?.id).map(loan => ({ ...loan,
-      overdue: !loan.returnedAt && at > loan.dueAt,
+      overdue: ['borrowed', 'returnPending'].includes(loan.status) && at > loan.dueAt,
       userName: db.users.find(item => item.id === loan.userId)?.name,
       userRole: db.users.find(item => item.id === loan.userId)?.role
     })).reverse();
@@ -155,13 +184,14 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
     const urls = lan ? [...new Set(addresses.map(item => `http://${item.address}:${port}/`)), localUrl] : [localUrl];
     return { now: at, rules: RULES, stages: STAGES, user, admin, demoUsers: DEMO_USERS,
       umbrellas: db.umbrellas.map(item => ({ ...item })), loans,
-      reminders: db.reminders.filter(item => admin || item.userId === user?.id).slice().reverse(),
+      reminders: db.reminders.filter(item => admin || (user && item.userId === user.id && item.status !== 'cancelled')).slice().reverse(),
       scoreEvents: db.scoreEvents.filter(item => admin || item.userId === user?.id).slice().reverse(),
       lockEvents: db.lockEvents.filter(item => admin || item.userId === user?.id).slice(-12).reverse(),
+      deviceEvents: db.deviceEvents.filter(item => admin || (user && db.loans.find(loan => loan.id === item.loanId)?.userId === user.id)).slice(-20).reverse(),
       users: admin ? db.users : [], maintenance: admin ? db.maintenance.slice().reverse() : [],
       damageReports: db.damageReports.filter(item => admin || item.userId === user?.id).slice().reverse().map(publicReport),
       canBorrow: !!user && user.score >= RULES.minimumScore && !activeLoan(user.id),
-      urls, lan, simulation: { identity: true, locks: true, push: true },
+      urls, lan, simulation: { identity: true, locks: true, push: true, device: true },
       totals: { available: db.umbrellas.filter(item => item.status === 'available').length,
         borrowed: db.umbrellas.filter(item => item.status === 'borrowed').length,
         maintenance: db.umbrellas.filter(item => item.status === 'maintenance').length,
@@ -251,21 +281,87 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
         if (url.pathname === '/api/borrow') {
           const user = getUser(req);
           if (user.score < RULES.minimumScore) fail('积分低于60分，借用权限暂时受限；归还雨伞后恢复。', 409);
-          if (activeLoan(user.id)) fail('每人同时只能借一把伞，请先归还当前雨伞。', 409);
+          const existing = activeLoan(user.id);
+          if (existing) {
+            if (existing.status === 'pendingPickup' && existing.umbrellaId === Number(input.umbrellaId))
+              return json(res, 200, { ok: true, loan: existing, pending: true, repeated: true,
+                message: '仓位已开锁，请取走雨伞。' });
+            fail('每人同时只能借一把伞，请先归还当前雨伞。', 409);
+          }
           const umbrella = db.umbrellas.find(item => item.id === Number(input.umbrellaId));
           if (!umbrella || umbrella.status !== 'available') fail('这把雨伞当前不可借，请选择其他雨伞。', 409);
+          if (umbrella.offline) fail('该仓位暂时离线，请选择其他雨伞。', 409);
+          if (umbrella.failNextOpen) {
+            umbrella.failNextOpen = false;
+            recordDevice(null, 'lock-failed', now(), { umbrellaId: umbrella.id, slotId: umbrella.slotId });
+            save(); fail('仓位开锁失败，未产生借用记录。', 409);
+          }
           const at = now();
           const loan = { id: crypto.randomUUID(), userId: user.id, umbrellaId: umbrella.id, slotId: umbrella.slotId,
-            borrowedAt: at, dueAt: at + RULES.borrowHours * HOUR, returnedAt: null, reminded: [], penalized: [], returnOpenedAt: null };
+            status: 'pendingPickup', reservedAt: at, reservedUntil: at + RULES.pickupSeconds * 1000,
+            borrowedAt: null, dueAt: null, returnedAt: null, reminded: [], penalizedDays: 0, returnOpenedAt: null };
           db.loans.push(loan);
-          umbrella.status = 'borrowed';
+          umbrella.status = 'pendingPickup';
           const event = lock(loan, 'borrow');
+          recordDevice(loan, 'lock-opened', at, { slotId: loan.slotId });
           save();
-          return json(res, 200, { ok: true, loan, lock: event, message: `${umbrella.slotId}号仓位已模拟解锁，借伞成功。` });
+          return json(res, 200, { ok: true, loan, lock: event, pending: true,
+            message: `${umbrella.slotId}号仓位已模拟解锁；检测到取走后才会借伞成功。` });
+        }
+        if (url.pathname === '/api/demo/device') {
+          const actor = getActor(req);
+          const eventType = String(input.event || '');
+          if (['fail-next-open', 'set-offline'].includes(eventType)) {
+            if (actor.role !== 'admin') fail('只有管理员可以设置设备故障。', 403);
+            const umbrella = db.umbrellas.find(item => item.slotId === Number(input.slotId));
+            if (!umbrella) fail('仓位不存在。', 404);
+            if (eventType === 'fail-next-open') umbrella.failNextOpen = true;
+            else umbrella.offline = input.offline === true;
+            recordDevice(null, eventType, now(), { umbrellaId: umbrella.id, slotId: umbrella.slotId });
+            save(); return json(res, 200, { ok: true });
+          }
+          const loan = db.loans.find(item => item.id === input.loanId);
+          if (!loan || (actor.role !== 'admin' && actor.userId !== loan.userId)) fail('借用单不存在或无权操作。', 404);
+          if (eventType === 'pickup') {
+            if (loan.status === 'borrowed') return json(res, 200, { ok: true, loan, repeated: true });
+            if (loan.status !== 'pendingPickup') fail('当前借用单不能确认取伞。', 409);
+            if (now() >= loan.reservedUntil) fail('取伞超时，请重新借用。', 409);
+            const at = now();
+            loan.status = 'borrowed'; loan.borrowedAt = at; loan.dueAt = at + RULES.borrowHours * HOUR;
+            db.umbrellas.find(item => item.id === loan.umbrellaId).status = 'borrowed';
+            recordDevice(loan, 'pickup', at, { slotId: loan.slotId });
+            save(); return json(res, 200, { ok: true, loan, message: '已检测到雨伞取走，借用成功。' });
+          }
+          if (eventType === 'fault') {
+            if (!['borrowed', 'returnPending'].includes(loan.status)) fail('当前借用单不能登记设备故障。', 409);
+            loan.penaltyFrozenAt ||= now();
+            recordDevice(loan, 'fault', now(), { slotId: loan.slotId });
+            save(); return json(res, 200, { ok: true, message: '已登记设备异常，暂停新增逾期扣分。' });
+          }
+          if (eventType === 'return-confirm') {
+            if (loan.status === 'returned') return json(res, 200, { ok: true, loan, repeated: true,
+              user: db.users.find(item => item.id === loan.userId) });
+            if (loan.status !== 'returnPending') fail('请先提交归还信息。', 409);
+            const umbrella = db.umbrellas.find(item => item.id === loan.umbrellaId);
+            if (umbrella.offline || Number(input.slotId) !== loan.slotId || Number(input.umbrellaId) !== loan.umbrellaId ||
+                input.present !== true || input.locked !== true || Number(input.stableMs) < RULES.stableSeconds * 1000) {
+              recordDevice(loan, 'return-rejected', now(), { slotId: Number(input.slotId) || null });
+              save(); fail('仓位编号、在位检测或锁闭状态未通过，暂未完成归还。', 409);
+            }
+            // Only the administrator simulates an authenticated device event observed earlier.
+            const observedAt = actor.role === 'admin' && Number.isFinite(Number(input.observedAt)) && input.observedAt != null
+              ? Number(input.observedAt) : now();
+            if (observedAt < loan.returnOpenedAt || observedAt > now()) fail('设备事件时间不可信。', 409);
+            finalizeReturn(loan, observedAt);
+            recordDevice(loan, 'return-confirm', observedAt, { slotId: loan.slotId, receivedAt: now() });
+            save(); return json(res, 200, { ok: true, loan, user: db.users.find(item => item.id === loan.userId),
+              message: loan.damaged ? '归还成功，雨伞已标记待维修。' : '归还成功，谢谢你把温暖传递下去。' });
+          }
+          fail('设备模拟事件不存在。', 400);
         }
         if (url.pathname === '/api/damage/report') {
           const user = getUser(req);
-          const loan = db.loans.find(item => item.id === input.loanId && item.userId === user.id && !item.returnedAt);
+          const loan = db.loans.find(item => item.id === input.loanId && item.userId === user.id && ['borrowed', 'returnPending'].includes(item.status));
           if (!loan) fail('只能上报自己正在借用的雨伞。', 404);
           const report = saveDamage(loan, user, input.description, input.photoData, now());
           save();
@@ -273,33 +369,35 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
         }
         if (url.pathname === '/api/return/open' || url.pathname === '/api/return') {
           const user = getUser(req);
-          const loan = db.loans.find(item => item.id === input.loanId && item.userId === user.id && !item.returnedAt);
+          const loan = db.loans.find(item => item.id === input.loanId && item.userId === user.id);
           if (!loan) fail('没有找到属于你的待归还雨伞。', 404);
           if (url.pathname.endsWith('/open')) {
+            if (!['borrowed', 'returnPending'].includes(loan.status)) fail('当前借用单不能打开归还仓位。', 409);
+            if (db.umbrellas.find(item => item.id === loan.umbrellaId).offline) fail('该仓位暂时离线，请稍后重试或报障。', 409);
             loan.returnOpenedAt = now();
             const event = lock(loan, 'return');
             save();
             return json(res, 200, { ok: true, loan, lock: event });
           }
+          if (loan.status === 'returned') return json(res, 200, { ok: true, pending: false, repeated: true,
+            loan, user, message: '这把伞已经归还。' });
+          if (!['borrowed', 'returnPending'].includes(loan.status)) fail('当前借用单不能归还。', 409);
           if (!loan.returnOpenedAt) fail('请先打开对应归还仓位。', 409);
           if (Number(input.umbrellaId) !== loan.umbrellaId || Number(input.slotId) !== loan.slotId) fail('雨伞编号与仓位不匹配，请放回对应编号仓位。', 409);
           if (input.confirmed !== true || typeof input.damaged !== 'boolean') fail('请确认雨伞已放入，并填写完好状态。');
+          if (loan.returnIntent) {
+            if (loan.returnIntent.damaged !== input.damaged) fail('归还信息已提交，不能更改报修状态。', 409);
+            return json(res, 200, { ok: true, pending: true, repeated: true, loan,
+              message: '归还信息已提交，正在等待仓位检测与锁闭。' });
+          }
           const earlierReport = db.damageReports.find(item => item.loanId === loan.id);
           if (earlierReport && !input.damaged) fail('这把伞已有报修记录，请按损坏雨伞归还。', 409);
           if (!input.damaged && (input.damageNote || input.photoData)) fail('请先勾选报修，再填写损坏情况。');
           if (input.damaged && !earlierReport && !input.damageNote) fail('请说明雨伞哪里坏了。');
           if (input.damaged && (input.damageNote || input.photoData)) saveDamage(loan, user, input.damageNote || earlierReport?.description, input.photoData, now());
-          const at = now();
-          loan.returnedAt = at;
-          loan.onTime = at <= loan.dueAt;
-          loan.damaged = input.damaged;
-          const umbrella = db.umbrellas.find(item => item.id === loan.umbrellaId);
-          umbrella.status = input.damaged ? 'maintenance' : 'available';
-          if (loan.onTime) changeScore(user, RULES.onTimeReward, '按时归还奖励', loan.id, at);
-          if (user.score < RULES.minimumScore) changeScore(user, RULES.minimumScore - user.score, '归还后恢复借用权限', loan.id, at);
-          if (input.damaged) db.maintenance.push({ id: crypto.randomUUID(), at, umbrellaId: umbrella.id, status: 'maintenance', note: db.damageReports.find(item => item.loanId === loan.id)?.description || '归还时报告损坏' });
+          loan.status = 'returnPending'; loan.returnIntent = { damaged: input.damaged, at: now() };
           save();
-          return json(res, 200, { ok: true, message: input.damaged ? '归还成功，雨伞已标记待维修。' : '归还成功，谢谢你把温暖传递下去。', user });
+          return json(res, 200, { ok: true, pending: true, loan, message: '正在等待仓位检测与锁闭，尚未完成归还。' });
         }
         if (url.pathname === '/api/admin/umbrella') {
           getActor(req, true);
@@ -312,6 +410,21 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
             save();
           }
           return json(res, 200, { ok: true });
+        }
+        if (url.pathname === '/api/admin/loan/exception') {
+          getActor(req, true);
+          const loan = db.loans.find(item => item.id === input.loanId);
+          if (!loan || !['borrowed', 'returnPending'].includes(loan.status)) fail('找不到需要处理的借用单。', 409);
+          const note = String(input.note || '').trim();
+          if (note.length < 2 || note.length > 300) fail('请填写2至300字的异常处理说明。');
+          if (!['maintenance', 'lost'].includes(input.umbrellaStatus)) fail('请选择待维修或遗失。');
+          loan.status = 'exception'; loan.closedAt = now(); loan.penaltyFrozenAt ||= now();
+          loan.exceptionNote = note;
+          db.umbrellas.find(item => item.id === loan.umbrellaId).status = input.umbrellaStatus;
+          db.maintenance.push({ id: crypto.randomUUID(), at: now(), umbrellaId: loan.umbrellaId,
+            status: input.umbrellaStatus, note });
+          recordDevice(loan, 'exception-closed', now(), { note });
+          save(); return json(res, 200, { ok: true, loan });
         }
         if (url.pathname === '/api/demo/advance') {
           getActor(req, true);
@@ -347,7 +460,7 @@ function createDemoServer({ dataFile = path.join(__dirname, 'data', 'state.json'
   });
   const timer = setInterval(() => { try { applyRules(); } catch (error) { console.error('提醒检查失败：', error.message); } }, 1000);
   timer.unref();
-  server.on('close', () => clearInterval(timer));
+  server.on('close', () => { clearInterval(timer); store.close(); });
   return server;
 }
 

@@ -3,8 +3,9 @@ const accounts = [
   { role: 'student', number: 'S2026002', name: '演示同学二', className: '高二（2）班' },
   { role: 'teacher', number: 'T0001', name: '演示老师', phone: '00000000000' }
 ];
-const statuses = { available: '可借用', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失' };
+const statuses = { available: '可借用', pendingPickup: '待取伞', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失' };
 const stamp = value => {
+  if (!value) return '待确认';
   const date = new Date(value); const pad = n => String(n).padStart(2, '0');
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
@@ -37,10 +38,10 @@ Page({
       const admin = this.data.tab === 'admin' && !!wx.getStorageSync('umbrella-admin');
       const state = await this.request('/api/state', undefined, admin);
       state.umbrellas = state.umbrellas.map(item => ({ ...item, statusText: statuses[item.status] }));
-      state.loans = state.loans.map(item => ({ ...item, borrowedText: stamp(item.borrowedAt), dueText: stamp(item.dueAt), returnedText: item.returnedAt ? stamp(item.returnedAt) : '', statusText: item.returnedAt ? '已归还' : item.overdue ? '逾期未还' : '借用中' }));
+      state.loans = state.loans.map(item => ({ ...item, borrowedText: stamp(item.borrowedAt), dueText: stamp(item.dueAt), returnedText: item.returnedAt ? stamp(item.returnedAt) : '', statusText: item.status === 'pendingPickup' ? '待取伞' : item.status === 'cancelled' ? '取伞超时取消' : item.status === 'exception' ? '异常已结案' : item.status === 'returnPending' ? '归还待检测' : item.returnedAt ? '已归还' : item.overdue ? '逾期未还' : '借用中' }));
       state.reminders = state.reminders.map(item => ({ ...item, timeText: stamp(item.at) }));
       state.damageReports = state.damageReports.map(item => ({ ...item, timeText: stamp(item.updatedAt), statusText: item.returned ? '已归还，待维修' : '借用中，已报修' }));
-      this.setData({ state, connected: true, currentLoan: state.loans.find(item => !item.returnedAt) || null, nowText: stamp(state.now), overdue: state.loans.filter(item => item.overdue), adminReady: !!wx.getStorageSync('umbrella-admin') });
+      this.setData({ state, connected: true, currentLoan: state.loans.find(item => ['pendingPickup', 'borrowed', 'returnPending'].includes(item.status)) || null, nowText: stamp(state.now), overdue: state.loans.filter(item => item.overdue), adminReady: !!wx.getStorageSync('umbrella-admin') });
     } catch (error) { this.setData({ error: error.message, connected: false }); }
   },
   selectAccount(event) { const index = Number(event.currentTarget.dataset.index); this.setData({ accountIndex: index, account: { ...accounts[index] } }); },
@@ -62,7 +63,13 @@ Page({
   changeTab(event) { this.setData({ tab: event.currentTarget.dataset.tab }); this.refresh(); },
   borrow(event) { this.run(async () => {
     const result = await this.request('/api/borrow', { umbrellaId: Number(event.currentTarget.dataset.id) });
-    await this.refresh(); wx.showModal({ title: `${result.loan.slotId}号仓位已模拟解锁`, content: `请取走${result.loan.umbrellaId}号伞，在${stamp(result.loan.dueAt)}前归还。`, showCancel: false });
+    await this.refresh(); wx.showModal({ title: `${result.loan.slotId}号仓位已模拟解锁`, content: `请取走${result.loan.umbrellaId}号伞；检测到取走后开始48小时借期。`, showCancel: false });
+  }); },
+  confirmPickup() { this.run(async () => {
+    const loan = this.data.currentLoan;
+    if (!loan || loan.status !== 'pendingPickup') throw new Error('没有待取走的雨伞。');
+    const result = await this.request('/api/demo/device', { event: 'pickup', loanId: loan.id });
+    await this.refresh(); wx.showToast({ title: `借伞成功，请在${stamp(result.loan.dueAt)}前归还`, icon: 'none' });
   }); },
   beginDamage(mode) { this.run(async () => {
     const loan = this.data.currentLoan;
@@ -104,10 +111,12 @@ Page({
     const damaged = this.data.damageMode === 'report' || this.data.damageFlag || !!report;
     if (damaged && this.data.damageNote.trim().length < 2) throw new Error('请说明雨伞哪里坏了。');
     if (this.data.damageMode === 'return' && !this.data.returnConfirmed) throw new Error('请确认雨伞已放入对应仓位。');
-    const result = this.data.damageMode === 'report'
+    let result = this.data.damageMode === 'report'
       ? await this.request('/api/damage/report', { loanId: loan.id, description: this.data.damageNote, photoData: this.photoData || '' })
       : await this.request('/api/return', { loanId: loan.id, umbrellaId: loan.umbrellaId, slotId: loan.slotId,
         confirmed: true, damaged, damageNote: damaged ? this.data.damageNote : '', photoData: damaged ? this.photoData || '' : '' });
+    if (this.data.damageMode === 'return') result = await this.request('/api/demo/device', { event: 'return-confirm', loanId: loan.id,
+      umbrellaId: loan.umbrellaId, slotId: loan.slotId, present: true, locked: true, stableMs: 3000 });
     this.cancelDamage(); await this.refresh(); wx.showToast({ title: result.message, icon: 'none' });
   }); },
   previewReport(event) { this.run(async () => {
