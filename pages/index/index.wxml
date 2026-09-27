@@ -1,23 +1,33 @@
-<!--index.wxml-->
-<view class="container">
-    <map 
-    class='map' 
-    show-location 
-    scale='19'
-    controls='{{controls}}'
-    bindcontroltap="controltap"
-    longitude="{{longitude}}" 
-    latitude="{{latitude}}"></map>
-
-    
-  <!-- <view class="userinfo">
-    <button wx:if="{{!hasUserInfo && canIUse}}" open-type="getUserInfo" bindgetuserinfo="getUserInfo"> 获取头像昵称 </button>
-    <block wx:else>
-      <image bindtap="bindViewTap" class="userinfo-avatar" src="{{userInfo.avatarUrl}}" background-size="cover"></image>
-      <text class="userinfo-nickname">{{userInfo.nickName}}</text>
-    </block>
+<view class="wrap">
+  <view class="hint">上海市格致中学 · 晴雨之间</view>
+  <view class="title">下雨了，借把伞吧。</view>
+  <view class="subtitle"><view>免费借用 · 无需押金 · 师生自助借还</view><view>实验原型：模拟身份认证、电子锁与消息推送。</view></view>
+  <view class="tabs"><button data-tab="cabinet" bindtap="changeTab" class="{{tab === 'cabinet' ? 'primary' : ''}}">借还</button><button data-tab="records" bindtap="changeTab" class="{{tab === 'records' ? 'primary' : ''}}">记录提醒</button><button data-tab="admin" bindtap="changeTab" class="{{tab === 'admin' ? 'primary' : ''}}">管理</button></view>
+  <view wx:if="{{error}}" class="panel warning">{{error}}<button bindtap="refresh" class="gap">重新连接</button></view>
+  <block wx:if="{{tab === 'cabinet' &amp;&amp; connected}}">
+    <view class="panel" wx:if="{{!state.user}}"><view class="section-title">演示身份认证</view><view class="row"><button data-index="0" bindtap="selectAccount">学生一</button><button data-index="1" bindtap="selectAccount">学生二</button><button data-index="2" bindtap="selectAccount">教师</button></view><view class="label">姓名</view><input class="field" value="{{account.name}}" data-field="account.name" bindinput="input"/><view class="label">学籍号 / 教师编号</view><input class="field" value="{{account.number}}" data-field="account.number" bindinput="input"/><view wx:if="{{account.role === 'student'}}"><view class="label">班级</view><input class="field" value="{{account.className}}" data-field="account.className" bindinput="input"/></view><view wx:else><view class="label">联系电话（演示号码）</view><input class="field" value="{{account.phone}}" data-field="account.phone" bindinput="input"/></view><view class="label">演示口令</view><input class="field" value="{{pin}}" data-field="pin" bindinput="input"/><button class="primary" bindtap="login" disabled="{{busy}}">认证并进入</button><view class="hint gap">仅使用虚构演示名单，不连接真实学籍系统或微信账号。</view></view>
+    <view class="panel" wx:else><view class="section-title">{{state.user.name}}</view><view class="score">{{state.user.score}} 分</view><view class="hint">按时归还 +5分，每人同时借一把，借期7天。</view><view wx:if="{{state.user.score &lt; 60}}" class="warning gap">低于60分，暂时限制借用；还伞后恢复。</view><view wx:if="{{currentLoan}}" class="gap"><view>正在借用 {{currentLoan.umbrellaId}}号伞</view><view class="hint">请于 {{currentLoan.dueText}} 前归还到 {{currentLoan.slotId}}号仓位。</view><button class="gap" bindtap="startReport" disabled="{{busy}}">上报雨伞损坏</button><button class="yellow gap" bindtap="startReturn" disabled="{{busy}}">归还这把伞</button></view><button class="gap" bindtap="logout">切换身份</button></view>
+    <view wx:if="{{damageMode}}" class="panel"><view class="section-title">{{damageMode === 'return' ? '自助归还' : '损坏上报'}} · {{currentLoan.umbrellaId}}号伞</view>
+      <view wx:if="{{damageMode === 'return'}}"><view class="hint">请把伞放入{{currentLoan.slotId}}号仓位并关好仓门。当前以自助确认模拟柜体检测。</view><view class="switch-line"><text>雨伞已放入对应仓位</text><switch checked="{{returnConfirmed}}" bindchange="toggleConfirmed"/></view><view class="switch-line"><text>这把伞已经坏了，需要报修</text><switch checked="{{damageFlag}}" bindchange="toggleDamage"/></view></view>
+      <view wx:if="{{damageMode === 'report' || damageFlag}}"><view class="label">损坏位置和情况</view><textarea class="field damage-textarea" value="{{damageNote}}" maxlength="300" placeholder="例如：伞骨弯曲，撑开后无法固定" data-field="damageNote" bindinput="input"/><button bindtap="chooseDamagePhoto" disabled="{{busy}}">拍照或选择损坏照片（选填）</button><image wx:if="{{damagePhotoPath}}" class="damage-photo" src="{{damagePhotoPath}}" mode="aspectFit"/><view class="hint gap">照片只供本人和维修管理员查看。已上报的伞归还后自动转待维修。</view></view>
+      <view class="row"><button bindtap="cancelDamage">取消</button><button class="primary" bindtap="submitDamage" disabled="{{busy}}">{{damageMode === 'return' ? '确认归还' : '提交报修'}}</button></view></view>
+    <view class="panel"><view class="section-title">爱心伞柜 · {{state.totals.available}} 把可借</view><button bindtap="scanLabel" disabled="{{busy}}">扫描伞 / 仓位标识</button><view wx:if="{{scanResult}}" class="hint gap">{{scanResult}}</view><view class="slots gap"><view wx:for="{{state.umbrellas}}" wx:key="id" class="slot"><view class="slot-number">{{item.id}}号</view><view class="umbrella">☂</view><view class="status">{{item.statusText}}</view><button bindtap="borrow" data-id="{{item.id}}" disabled="{{busy || !state.canBorrow || item.status !== 'available'}}">借这把</button></view></view></view>
+  </block>
+  <view wx:if="{{tab === 'records' &amp;&amp; connected}}">
+    <view wx:if="{{!state.user}}" class="panel">请先在借还页面完成身份认证。</view>
+    <block wx:else><view class="panel"><view class="section-title">我的借还记录</view><view wx:if="{{!state.loans.length}}" class="empty">暂时没有借还记录。</view><view wx:for="{{state.loans}}" wx:key="id" class="record"><view class="record-title">{{item.umbrellaId}}号伞 · {{item.statusText}}</view><view class="hint"><view>借出：{{item.borrowedText}}</view><view>应还：{{item.dueText}}</view><view wx:if="{{item.returnedAt}}">归还：{{item.returnedText}}</view></view></view></view>
+    <view class="panel"><view class="section-title">我的报修</view><view wx:for="{{state.damageReports}}" wx:key="id" class="record"><view class="record-title">{{item.umbrellaId}}号伞 · {{item.statusText}}</view><view>{{item.description}}</view><view class="hint">{{item.timeText}}</view><button wx:if="{{item.hasPhoto}}" data-id="{{item.id}}" bindtap="previewReport">查看损坏照片</button></view><view wx:if="{{!state.damageReports.length}}" class="empty">暂无报修记录。</view></view>
+    <view class="panel"><view class="section-title">归还提醒</view><view class="hint">站内消息用于模拟微信推送效果。</view><view wx:if="{{!state.reminders.length}}" class="empty">暂时没有提醒，可在管理页推进实验时间。</view><view wx:for="{{state.reminders}}" wx:key="id" class="record"><view class="record-title">{{item.stage}} · {{item.umbrellaId}}号伞</view><view>{{item.text}}</view><view class="hint">{{item.timeText}}</view></view></view>
+    <view class="panel"><view class="section-title">积分明细</view><view wx:for="{{state.scoreEvents}}" wx:key="id" class="record">{{item.reason}}　{{item.change > 0 ? '+' : ''}}{{item.change}}分<view class="hint">积分余额：{{item.score}}</view></view><view wx:if="{{!state.scoreEvents.length}}" class="empty">暂无积分变化。</view></view></block>
   </view>
-  <view class="usermotto">
-    <text class="user-motto">{{motto}}</text>
-  </view> -->
+  <view wx:if="{{tab === 'admin'}}">
+    <view class="panel" wx:if="{{!adminReady}}"><view class="section-title">管理员演示入口</view><input class="field" value="{{adminPin}}" data-field="adminPin" bindinput="input"/><button class="primary" bindtap="adminLogin" disabled="{{busy}}">进入后台</button><view class="hint gap">演示口令：2026</view></view>
+    <block wx:elif="{{state.admin &amp;&amp; connected}}"><view class="panel controls"><view class="section-title">实验控制台</view><view class="hint">实验时间：{{nowText}}</view><view class="row"><button data-hours="168" bindtap="advance">+7天</button><button data-hours="25" bindtap="advance">再+25小时</button><button data-hours="48" bindtap="advance">再+48小时</button></view><button bindtap="reset">重置实验</button></view>
+    <view class="panel"><view class="section-title">库存与损耗</view><view class="hint">可借 {{state.totals.available}} / 借出 {{state.totals.borrowed}} / 待修 {{state.totals.maintenance}} / 遗失 {{state.totals.lost}}</view><view wx:for="{{state.umbrellas}}" wx:key="id" class="record"><view>{{item.id}}号伞 · {{item.statusText}}</view><button wx:if="{{item.status !== 'borrowed'}}" data-id="{{item.id}}" bindtap="changeStatus">调整状态</button></view></view>
+    <view class="panel"><view class="section-title">逾期名单</view><view wx:if="{{!overdue.length}}" class="empty">暂时无人逾期。</view><view wx:for="{{overdue}}" wx:key="id" class="record">{{item.userName}} · {{item.umbrellaId}}号伞<view class="hint">应还：{{item.dueText}}</view></view></view>
+    <view class="panel"><view class="section-title">全部借还记录</view><view wx:for="{{state.loans}}" wx:key="id" class="record">{{item.userName}} · {{item.umbrellaId}}号伞 · {{item.statusText}}<view class="hint"><view>借出：{{item.borrowedText}}</view><view>应还：{{item.dueText}}</view></view></view><view wx:if="{{!state.loans.length}}" class="empty">暂无记录。</view></view>
+    <view class="panel"><view class="section-title">报修说明与照片</view><view wx:for="{{state.damageReports}}" wx:key="id" class="record"><view class="record-title">{{item.userName}} · {{item.umbrellaId}}号伞 · {{item.statusText}}</view><view>{{item.description}}</view><view class="hint">{{item.timeText}}</view><button wx:if="{{item.hasPhoto}}" data-id="{{item.id}}" bindtap="previewReport">查看损坏照片</button></view><view wx:if="{{!state.damageReports.length}}" class="empty">暂无报修记录。</view></view>
+    <view class="panel"><view class="section-title">用户积分</view><view wx:for="{{state.users}}" wx:key="id" class="record">{{item.name}}　{{item.score}}分</view></view></block>
+  </view>
+  <view class="hint">本实验不收取任何费用。请将雨伞放回同编号仓位。</view>
 </view>

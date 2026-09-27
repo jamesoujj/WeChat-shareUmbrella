@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#eaf5fb">
+  <title>晴雨之间 · 校园爱心伞</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/" aria-label="上海市格致中学校园爱心伞首页"><span class="brand-icon">☂</span><span>上海市格致中学<small>晴雨之间 · 校园爱心伞</small></span></a><span class="experiment-badge">实验演示版</span></header>
+  <main>
+    <section class="hero"><div><h1>下雨了，<br>借把伞吧。</h1><p>师生自助借还，雨天随时可用。<br>借走时安心，归还时把温暖留下。</p></div><div class="promise"><span>免费借用</span><span>无需押金</span><span>无人值守</span></div></section>
+    <nav class="tabs" aria-label="功能导航"><button class="active" data-tab="cabinet">借还雨伞</button><button data-tab="records">我的记录 <span id="reminder-count"></span></button><button data-tab="admin">管理后台</button></nav>
+    <div id="app" aria-live="polite"><p class="loading">正在打开爱心伞柜…</p></div>
+    <details class="experiment-panel"><summary>实验控制台 <span id="clock"></span></summary><div class="control-body"><p>模拟电子锁、身份核验和消息推送；借还记录、报修照片和积分计算实际运行并保存在本机。</p><div class="button-row"><button data-advance="168">推进7天</button><button data-advance="25">再推进25小时</button><button data-advance="48">再推进48小时</button><button class="danger-text" id="reset-demo">重置实验</button></div><p class="hint">依次点击，可展示借出满7天、逾期1天和逾期3天提醒。控制操作需要管理员演示口令：2026。</p></div></details>
+  </main>
+  <footer>请把雨伞放回同编号仓位，让下一位需要的人也能借到。<span>本实验不收取任何费用。</span></footer>
+  <dialog id="modal"><div id="modal-content"></div></dialog>
+  <div id="toast" role="status" aria-live="assertive"></div>
+</body>
+</html>

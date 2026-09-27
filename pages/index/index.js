@@ -1,200 +1,132 @@
-//index.js
-//获取应用实例
-const app = getApp();
-const api = require('../../utils/api.js');
-
+const accounts = [
+  { role: 'student', number: 'S2026001', name: '演示同学一', className: '高二（1）班' },
+  { role: 'student', number: 'S2026002', name: '演示同学二', className: '高二（2）班' },
+  { role: 'teacher', number: 'T0001', name: '演示老师', phone: '00000000000' }
+];
+const statuses = { available: '可借用', borrowed: '已借出', maintenance: '待维修', lost: '已登记遗失' };
+const stamp = value => {
+  const date = new Date(value); const pad = n => String(n).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
 Page({
-    data: {
-        // 用于地图组件显示的数据
-        latitude: null,
-        longitude: null,
-        controls: [],
-    },
-    // 点击地图上的控件触发的事件
-    controltap: function(e) {
-      switch (e.controlId) {
-        case 1: this.toWelcomePage();break;
-        case 2: this.refreshLocation();break;
-        case 3: this.toWalletPage();break;
-      }
-    },
-    // 获取屏幕信息函数
-    getSystemInfoData: function () {
-        const that = this;
-        wx.getSystemInfo({
-            success: function (res) {
-                that.setData({
-                    controls: [
-                      {
-                        id: 1,
-                        iconPath: '/utils/icons/use.png',
-                        position: {
-                            left: (res.windowWidth - 80) / 2,
-                            top: res.windowHeight - 100,
-                            width: 80,
-                            height: 80
-                        },
-                        clickable: true
-                      },
-                      {
-                        id: 2,
-                        iconPath: '/utils/icons/refresh.png',
-                        position: {
-                          left: res.windowWidth/4 - 20,
-                          top: res.windowHeight - 100 + 20,
-                          width: 40,
-                          height: 40
-                        },
-                        clickable: true
-                      },
-                      {
-                        id: 3,
-                        iconPath: '/utils/icons/wallet.png',
-                        position: {
-                          left: res.windowWidth / 2 + res.windowWidth / 4 - 20,
-                          top: res.windowHeight - 100 + 20,
-                          width: 40,
-                          height: 40
-                        },
-                        clickable: true
-                      },
-                    ]
-                })
-            }
-        })
-    },
-    // 重新刷新获取位置
-    refreshLocation() {
-      const that = this;
-      wx.showLoading({
-        title: '正在刷新位置',
-      });
-      api.getLocation().then(res => {
-        that.setData({
-          latitude: res.latitude,
-          longitude: res.longitude
-        });
-        wx.hideLoading();
-      });
-    },
-    // 跳转去欢迎使用页面
-    toWelcomePage() {
-      wx.navigateTo({
-        url: '../welcome/welcome'
-      })
-    },
-    // 跳转去我的钱包页面
-    toWalletPage() {
-      wx.navigateTo({
-        url: '../wallet/wallet'
-      })
-    },
-    // 页面初始化先执行的方法
-    onLoad: function () {
-        const that = this;
-        wx.showLoading({
-          title: '正在登录中',
-        });
-        // 1.登录,获取用户token
-        api.login().then(res => {
-          wx.hideLoading();
-          const token = `bearer ${res.data.data['access_token']}`;
-          // 放到全局app里去
-          app.globalData.token = token;
-          console.log(`首页token: ${token}`);
-          wx.showLoading({
-            title: '正在查询押金',
-          });
-          // 2.判断当前用户是否交了押金
-          api.checkDeposit(token).then(res2 => {
-            wx.hideLoading();
-            if(res2.data.data) {
-              console.log("判断有没交押金：有");
-              wx.showLoading({
-                title: '正在查询订单1',
-              });
-              // 3.判断当前用户是否有正在进行的订单
-              api.proceedOrder(token).then(res3 => {
-                wx.hideLoading();
-                // 没有进行中的订单
-                if (res3.data.code === 23011) {
-                  console.log("判断有没进行中的订单：没有");
-                  wx.showLoading({
-                    title: '正在查询订单2',
-                  });
-                  // 4. 判断当前用户是否有待支付的订单
-                  api.unpaidOrder(token).then(res4 => {
-                    wx.hideLoading();
-                    if(res4.data.code === 23013) {
-                      console.log("判断有没待支付的订单：没有");
-                      // 5.获取屏幕信息
-                      that.getSystemInfoData();
-                      // 6.获取到当前用户的位置,定位在地图上
-                      wx.showLoading({
-                        title: '正在获取位置',
-                      });
-                      api.getLocation().then(res6 => {
-                        that.setData({
-                          latitude: res6.latitude,
-                          longitude: res6.longitude
-                        });
-                        wx.hideLoading();
-                      });
-                    }
-                    else if (res4.data.code === 23012) {
-                      wx.redirectTo({
-                        url: '../pay/pay'
-                      });
-                    }
-                  });
-                  
-                }
-                // 有进行中的订单，应跳转到订单详情页面
-                else if (res3.data.code === 23010) {
-                  wx.redirectTo({
-                    url: '../order/order'
-                  })
-                }
-              })
-            }
-            else {
-              console.log("你没交押金");             
-              wx.redirectTo({
-                url: '../payDeposit/payDeposit'
-              })
-            }
-          })
-        })
-        
-        
-        
-
-        // if (app.globalData.userInfo) {
-        //     this.setData({
-        //         userInfo: app.globalData.userInfo,
-        //         hasUserInfo: true
-        //     })
-        // } else if (this.data.canIUse) {
-        //     // 由于 getUserInfo 是网络请求，可能会在 Page.onLoad 之后才返回
-        //     // 所以此处加入 callback 以防止这种情况
-        //     app.userInfoReadyCallback = res =>
-        //     {
-        //         this.setData({
-        //             userInfo: res.userInfo,
-        //             hasUserInfo: true
-        //         })
-        //     }
-        // } else {
-        //     // 在没有 open-type=getUserInfo 版本的兼容处理
-        //     wx.getUserInfo({
-        //         success: res => {
-        //         app.globalData.userInfo = res.userInfo
-        //     this.setData({
-        //         userInfo: res.userInfo,
-        //         hasUserInfo: true
-        //       })
-        //     }
-        //   })
-        // }
+  data: { tab: 'cabinet', account: accounts[0], pin: '123456', accountIndex: 0, state: null, busy: false, currentLoan: null, connected: false, error: '', adminPin: '2026', adminReady: false, scanResult: '',
+    damageMode: '', damageNote: '', damagePhotoPath: '', damageFlag: false, returnConfirmed: false },
+  onLoad() { this.refresh(); },
+  onShow() { this.timer = setInterval(() => { if (!this.data.busy) this.refresh(); }, 5000); },
+  onHide() { clearInterval(this.timer); },
+  onUnload() { clearInterval(this.timer); },
+  request(route, input, admin = false) {
+    return new Promise((resolve, reject) => {
+      const token = wx.getStorageSync(admin ? 'umbrella-admin' : 'umbrella-user');
+      wx.request({ url: getApp().globalData.baseUrl + route, method: input === undefined ? 'GET' : 'POST', data: input,
+        header: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        success: response => {
+          if (response.statusCode >= 200 && response.statusCode < 300) return resolve(response.data);
+          if (response.statusCode === 401) { wx.removeStorageSync(admin ? 'umbrella-admin' : 'umbrella-user'); if (admin) this.setData({ adminReady: false }); }
+          reject(new Error(response.data.error || '请求失败'));
+        }, fail: () => reject(new Error('无法连接实验服务，请检查电脑启动窗口、baseUrl和开发工具的本地调试设置。')) });
+    });
+  },
+  async run(action) {
+    if (this.data.busy) return; this.setData({ busy: true, error: '' });
+    try { await action(); } catch (error) { this.setData({ error: error.message }); wx.showToast({ title: error.message, icon: 'none', duration: 3000 }); }
+    finally { this.setData({ busy: false }); }
+  },
+  async refresh() {
+    try {
+      const admin = this.data.tab === 'admin' && !!wx.getStorageSync('umbrella-admin');
+      const state = await this.request('/api/state', undefined, admin);
+      state.umbrellas = state.umbrellas.map(item => ({ ...item, statusText: statuses[item.status] }));
+      state.loans = state.loans.map(item => ({ ...item, borrowedText: stamp(item.borrowedAt), dueText: stamp(item.dueAt), returnedText: item.returnedAt ? stamp(item.returnedAt) : '', statusText: item.returnedAt ? '已归还' : item.overdue ? '逾期未还' : '借用中' }));
+      state.reminders = state.reminders.map(item => ({ ...item, timeText: stamp(item.at) }));
+      state.damageReports = state.damageReports.map(item => ({ ...item, timeText: stamp(item.updatedAt), statusText: item.returned ? '已归还，待维修' : '借用中，已报修' }));
+      this.setData({ state, connected: true, currentLoan: state.loans.find(item => !item.returnedAt) || null, nowText: stamp(state.now), overdue: state.loans.filter(item => item.overdue), adminReady: !!wx.getStorageSync('umbrella-admin') });
+    } catch (error) { this.setData({ error: error.message, connected: false }); }
+  },
+  selectAccount(event) { const index = Number(event.currentTarget.dataset.index); this.setData({ accountIndex: index, account: { ...accounts[index] } }); },
+  scanLabel() {
+    this.run(async () => {
+      const result = await new Promise((resolve, reject) => wx.scanCode({ onlyFromCamera: false, success: resolve, fail: reject }));
+      const match = /[?&](umbrella|slot)=(\d+)(?:&|$)/.exec(result.result || '');
+      if (!match) throw new Error('这不是本实验的雨伞或仓位二维码。');
+      const kind = match[1]; const id = Number(match[2]);
+      const umbrella = this.data.state.umbrellas.find(item => item.id === id);
+      if (!umbrella) throw new Error('没有找到这个编号。');
+      this.setData({ tab: 'cabinet', scanResult: `${id}号${kind === 'umbrella' ? '伞' : '仓位'} · 对应${id}号${kind === 'umbrella' ? '仓位' : '伞'} · ${statuses[umbrella.status]}` });
+      if (kind === 'slot' && this.data.currentLoan && this.data.currentLoan.slotId === id) wx.showToast({ title: '编号匹配，请点击归还这把伞', icon: 'none' });
+    });
+  },
+  input(event) { this.setData({ [event.currentTarget.dataset.field]: event.detail.value }); },
+  login() { this.run(async () => { const result = await this.request('/api/login', { ...this.data.account, pin: this.data.pin }); wx.setStorageSync('umbrella-user', result.token); await this.refresh(); }); },
+  logout() { this.run(async () => { await this.request('/api/logout', {}); wx.removeStorageSync('umbrella-user'); await this.refresh(); }); },
+  changeTab(event) { this.setData({ tab: event.currentTarget.dataset.tab }); this.refresh(); },
+  borrow(event) { this.run(async () => {
+    const result = await this.request('/api/borrow', { umbrellaId: Number(event.currentTarget.dataset.id) });
+    await this.refresh(); wx.showModal({ title: `${result.loan.slotId}号仓位已模拟解锁`, content: `请取走${result.loan.umbrellaId}号伞，在${stamp(result.loan.dueAt)}前归还。`, showCancel: false });
+  }); },
+  beginDamage(mode) { this.run(async () => {
+    const loan = this.data.currentLoan;
+    if (!loan) throw new Error('请先借用雨伞。');
+    if (mode === 'return') await this.request('/api/return/open', { loanId: loan.id });
+    const report = this.data.state.damageReports.find(item => item.loanId === loan.id);
+    this.photoData = '';
+    this.setData({ damageMode: mode, damageNote: report ? report.description : '', damageFlag: !!report,
+      damagePhotoPath: '', returnConfirmed: false });
+  }); },
+  startReturn() { this.beginDamage('return'); },
+  startReport() { this.beginDamage('report'); },
+  cancelDamage() { this.photoData = ''; this.setData({ damageMode: '', damagePhotoPath: '' }); },
+  toggleDamage(event) {
+    const report = this.data.state.damageReports.find(item => item.loanId === this.data.currentLoan?.id);
+    if (report && !event.detail.value) return wx.showToast({ title: '已报修的雨伞请按损坏状态归还', icon: 'none' });
+    this.setData({ damageFlag: !!event.detail.value });
+  },
+  toggleConfirmed(event) { this.setData({ returnConfirmed: !!event.detail.value }); },
+  chooseDamagePhoto() { this.run(async () => {
+    const result = await new Promise((resolve, reject) => wx.chooseImage({ count: 1, sizeType: ['compressed'], sourceType: ['camera', 'album'], success: resolve, fail: reject }));
+    let file = result.tempFiles[0];
+    if (file.size > 1500000) {
+      const compressed = await new Promise((resolve, reject) => wx.compressImage({ src: file.path, quality: 55, compressedWidth: 1200, success: resolve, fail: reject }));
+      const info = await new Promise((resolve, reject) => wx.getFileInfo({ filePath: compressed.tempFilePath, success: resolve, fail: reject }));
+      file = { path: compressed.tempFilePath, size: info.size };
     }
-})
+    if (file.size > 1500000) throw new Error('照片仍大于1.5MB，请换一张照片。');
+    const data = await new Promise((resolve, reject) => wx.getFileSystemManager().readFile({ filePath: file.path, encoding: 'base64', success: item => resolve(item.data), fail: reject }));
+    const type = data.startsWith('/9j/') ? 'jpeg' : data.startsWith('iVBORw0KGgo') ? 'png' : data.startsWith('UklGR') ? 'webp' : '';
+    if (!type) throw new Error('请选择JPG、PNG或WEBP照片。');
+    this.photoData = `data:image/${type};base64,${data}`;
+    this.setData({ damagePhotoPath: file.path });
+  }); },
+  submitDamage() { this.run(async () => {
+    const loan = this.data.currentLoan;
+    if (!loan) throw new Error('当前没有借用中的雨伞。');
+    const report = this.data.state.damageReports.find(item => item.loanId === loan.id);
+    const damaged = this.data.damageMode === 'report' || this.data.damageFlag || !!report;
+    if (damaged && this.data.damageNote.trim().length < 2) throw new Error('请说明雨伞哪里坏了。');
+    if (this.data.damageMode === 'return' && !this.data.returnConfirmed) throw new Error('请确认雨伞已放入对应仓位。');
+    const result = this.data.damageMode === 'report'
+      ? await this.request('/api/damage/report', { loanId: loan.id, description: this.data.damageNote, photoData: this.photoData || '' })
+      : await this.request('/api/return', { loanId: loan.id, umbrellaId: loan.umbrellaId, slotId: loan.slotId,
+        confirmed: true, damaged, damageNote: damaged ? this.data.damageNote : '', photoData: damaged ? this.photoData || '' : '' });
+    this.cancelDamage(); await this.refresh(); wx.showToast({ title: result.message, icon: 'none' });
+  }); },
+  previewReport(event) { this.run(async () => {
+    const id = event.currentTarget.dataset.id;
+    const token = wx.getStorageSync(this.data.tab === 'admin' ? 'umbrella-admin' : 'umbrella-user');
+    const result = await new Promise((resolve, reject) => wx.downloadFile({ url: getApp().globalData.baseUrl + '/api/damage/photo/' + id,
+      header: { Authorization: 'Bearer ' + token }, success: resolve, fail: reject }));
+    if (result.statusCode !== 200) throw new Error('照片读取失败。');
+    wx.previewImage({ urls: [result.tempFilePath] });
+  }); },
+  adminLogin() { this.run(async () => { const result = await this.request('/api/admin/login', { pin: this.data.adminPin }); wx.setStorageSync('umbrella-admin', result.token); this.setData({ adminReady: true }); await this.refresh(); }); },
+  advance(event) { this.run(async () => { await this.request('/api/demo/advance', { hours: Number(event.currentTarget.dataset.hours) }, true); await this.refresh(); wx.showToast({ title: '实验时间已推进', icon: 'none' }); }); },
+  changeStatus(event) { this.run(async () => {
+    const index = await new Promise(resolve => wx.showActionSheet({ itemList: ['恢复可借用', '标记待维修', '登记遗失'], success: result => resolve(result.tapIndex), fail: () => resolve(-1) }));
+    if (index < 0) return;
+    await this.request('/api/admin/umbrella', { umbrellaId: Number(event.currentTarget.dataset.id), status: ['available', 'maintenance', 'lost'][index] }, true); await this.refresh();
+  }); },
+  reset() { this.run(async () => {
+    const ok = await new Promise(resolve => wx.showModal({ title: '重置实验？', content: '将清空本原型的借还、积分和提醒记录。', success: result => resolve(result.confirm), fail: () => resolve(false) }));
+    if (ok) { await this.request('/api/demo/reset', { confirm: 'RESET' }, true); await this.refresh(); }
+  }); }
+});
